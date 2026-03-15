@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import numbers
 import os
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -34,32 +33,12 @@ class RecordVideo(gym.Wrapper):
     """
     A general video recording wrapper that owns the recording logic.
 
-    ``RecordVideo`` centralizes frame collection and MP4 writing for both regular
-    stepping and chunked stepping APIs. Frames are buffered in memory and flushed
-    asynchronously to avoid blocking environment interaction.
-
-    The wrapper supports multiple observation image layouts (single frame, batched
-    frames, and temporal batches). For ``chunk_step()``, it correctly handles the
-    terminal-to-reset transition by recording terminal observations (for the last
-    step in the chunk) and then appending the corresponding reset observations.
-
-    When ``video_cfg.info_on_video`` is enabled, per-frame text metadata is drawn
-    through ``put_info_on_image()``. The overlay always includes reward and
-    termination when available, and can include extra fields from environment
-    ``info`` via ``video_cfg.extra_info_on_video``. Nested keys are supported with
-    dot notation, for example
-    ``["env_id", "episode.success_once", "episode.episode_len"]``.
-
-    Args:
-        env: Wrapped environment. It must expose a ``seed`` attribute and may
-            optionally provide ``num_envs`` and metadata for FPS inference.
-        video_cfg: Video configuration object/dict. Common fields:
-            ``video_base_dir`` (output directory root),
-            ``fps`` (optional FPS override),
-            ``info_on_video`` (whether to render overlay text),
-            ``extra_info_on_video`` (list of ``info`` keys to render).
-        fps: Explicit FPS override. If ``None``, FPS is resolved from
-            ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
+    Features:
+    1. Manage render_images and video_cnt
+    2. Append frames after reset/step/chunk_step
+    3. Provide flush_video to save videos
+    4. Support multiple obs image formats and batched/sequence inputs
+    5. Per-env video mode: each env writes an independent mp4 (streaming)
     """
 
     def __init__(self, env: gym.Env, video_cfg, fps: Optional[int] = None):
@@ -83,6 +62,13 @@ class RecordVideo(gym.Wrapper):
             self._fps = fps
         else:
             self._fps = self._get_fps_from_env(env)
+
+        # Per-env video mode: each env gets its own streaming mp4 writer
+        self._per_env_video: bool = bool(
+            video_cfg.get("per_env_video", False)
+        )
+        self._per_env_writers: list[Optional[Any]] = [None] * self._num_envs
+        self._per_env_video_paths: list[str] = [""] * self._num_envs
 
     def _get_fps_from_env(self, env: gym.Env) -> int:
         """Resolve FPS from config/env metadata with fallback."""
@@ -190,7 +176,7 @@ class RecordVideo(gym.Wrapper):
 
     def _value_for_env(self, value: Any, env_id: int):
         """Select a scalar/value for a specific env from batched inputs."""
-        if isinstance(value, torch.Tensor):
+        if torch is not None and isinstance(value, torch.Tensor):
             value = value.detach().cpu().numpy()
         if isinstance(value, np.ndarray):
             if value.shape == ():
@@ -221,36 +207,8 @@ class RecordVideo(gym.Wrapper):
             return task_desc[0] if isinstance(task_desc, (list, tuple)) else task_desc
         return None
 
-    def _get_video_info_keys(self) -> list[str]:
-        """Get configured info keys to overlay on video frames."""
-        if hasattr(self.video_cfg, "extra_info_on_video"):
-            keys = getattr(self.video_cfg, "extra_info_on_video")
-        else:
-            keys = None
-
-        if keys:
-            if isinstance(keys, str):
-                return [keys]
-            return list(keys)
-        return []
-
-    def _lookup_info_value(self, info: Any, key: str) -> Any:
-        """Read a key from info, supporting dotted access for nested dicts."""
-        if not isinstance(info, dict):
-            return None
-        if key in info:
-            return info[key]
-
-        value = info
-        for part in key.split("."):
-            if not isinstance(value, dict) or part not in value:
-                return None
-            value = value[part]
-        return value
-
     def _build_info_item(
         self,
-        infos: Optional[Any],
         rewards: Optional[Any],
         terminations: Optional[Any],
         env_id: int,
@@ -273,44 +231,70 @@ class RecordVideo(gym.Wrapper):
                     value = value[time_idx]
             info_item["termination"] = bool(value) if value is not None else value
 
-        if infos is not None:
-            for key in self._get_video_info_keys():
-                value = self._lookup_info_value(infos, key)
-                if value is None:
-                    continue
-                value = self._value_for_env(value, env_id)
-                if isinstance(value, np.ndarray):
-                    if value.shape == ():
-                        value = value.item()
-                    elif value.size == 1:
-                        value = value.reshape(-1)[0].item()
-                elif isinstance(value, numbers.Number):
-                    pass
-                else:
-                    warnings.warn(f"Unsupported value type {type(value)} for key {key}")
-                    continue
-                info_item[key] = value
-
         return info_item
+
+    # ------------------------------------------------------------------
+    # Per-env video helpers
+    # ------------------------------------------------------------------
+
+    def _open_per_env_writers(self) -> None:
+        """Create an imageio writer for each env (streaming mode)."""
+        base_dir = os.path.join(
+            self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
+        )
+        for i in range(self._num_envs):
+            env_dir = os.path.join(base_dir, f"env_{i}")
+            os.makedirs(env_dir, exist_ok=True)
+            mp4_path = os.path.join(env_dir, f"{self.video_cnt}.mp4")
+            self._per_env_video_paths[i] = mp4_path
+            self._per_env_writers[i] = imageio.get_writer(mp4_path, fps=self._fps)
+
+    def _close_per_env_writers(self) -> None:
+        """Close all per-env writers."""
+        for i in range(self._num_envs):
+            writer = self._per_env_writers[i]
+            if writer is not None:
+                writer.close()
+                self._per_env_writers[i] = None
+        self.video_cnt += 1
+
+    def _write_per_env_frames(self, images: list[np.ndarray]) -> None:
+        """Write one frame per env to their respective streaming writers."""
+        for i, img in enumerate(images):
+            writer = self._per_env_writers[i]
+            if writer is not None and img is not None:
+                writer.append_data(img)
+
+    def get_per_env_video_paths(self) -> list[str]:
+        """Return the list of per-env video file paths from the last flush."""
+        return list(self._per_env_video_paths)
+
+    # ------------------------------------------------------------------
+    # Frame appending
+    # ------------------------------------------------------------------
 
     def _append_frame(
         self,
         images: list[np.ndarray],
-        infos: Optional[Any],
         rewards: Optional[Any],
         terminations: Optional[Any],
         time_idx: Optional[int] = None,
     ) -> None:
-        """Overlay info (optional) and append a tiled frame."""
+        """Overlay info (optional) and append a tiled frame or write per-env."""
         if not images:
             return
+
+        # In per-env mode, write each env's frame to its own writer directly
+        if self._per_env_video:
+            # Skip overlay in per-env mode (raw frames only)
+            self._write_per_env_frames(images)
+            return
+
         if self.video_cfg.get("info_on_video", True):
             images = [
                 put_info_on_image(
                     img,
-                    self._build_info_item(
-                        infos, rewards, terminations, env_id, time_idx
-                    ),
+                    self._build_info_item(rewards, terminations, env_id, time_idx),
                 )
                 for env_id, img in enumerate(images)
             ]
@@ -339,16 +323,17 @@ class RecordVideo(gym.Wrapper):
 
         if isinstance(infos, (list, tuple)):
             for time_idx, images in enumerate(frames):
-                step_info = infos[time_idx] if len(infos) > time_idx else None
-                self._append_frame(images, step_info, rewards, terminations, time_idx)
+                self._append_frame(images, rewards, terminations, time_idx)
             return
 
         for time_idx, images in enumerate(frames):
-            self._append_frame(images, infos, rewards, terminations, time_idx)
+            self._append_frame(images, rewards, terminations, time_idx)
 
     def reset(self, *args, **kwargs):
         """Reset env and record the initial frame."""
         obs, info = self.env.reset(*args, **kwargs)
+        if self._per_env_video:
+            self._open_per_env_writers()
         self.add_new_frames(obs, info)
         return obs, info
 
@@ -398,7 +383,11 @@ class RecordVideo(gym.Wrapper):
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        """Write buffered frames to an MP4 file (async)."""
+        """Write buffered frames to an MP4 file (async), or close per-env writers."""
+        if self._per_env_video:
+            self._close_per_env_writers()
+            return
+
         if not self.render_images:
             return
 
@@ -437,6 +426,12 @@ class RecordVideo(gym.Wrapper):
     def _prune_futures(self) -> None:
         """Remove finished futures to avoid unbounded growth."""
         self._save_futures = [f for f in self._save_futures if not f.done()]
+
+    def wait_for_saves(self) -> None:
+        """Block until all pending video writes have completed."""
+        for f in self._save_futures:
+            f.result()
+        self._save_futures = []
 
     def close(self):
         """Wait for pending video writes before closing."""

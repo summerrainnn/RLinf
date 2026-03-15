@@ -26,10 +26,3 @@ Thanks to this decoupled design, workers can be flexibly and dynamically schedul
        </p>
      </div>
    </div>
-
-
-.. toctree::
-   :hidden:
-   :maxdepth: 2
-
-   fusco

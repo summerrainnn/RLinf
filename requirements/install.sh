@@ -147,7 +147,7 @@ install_uv() {
 setup_mirror() {
     if [ "$USE_MIRRORS" -eq 1 ]; then
         export UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
-        export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple
+        export UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
         export HF_ENDPOINT=https://hf-mirror.com
         export GITHUB_PREFIX="https://ghfast.top/"
         git config --global url."${GITHUB_PREFIX}github.com/".insteadOf "https://github.com/"
@@ -200,10 +200,17 @@ EOF
         # shellcheck disable=SC1090
         source "$VENV_DIR/bin/activate"
     fi
-    UV_TORCH_BACKEND=auto uv sync --active $NO_INSTALL_RLINF_CMD
+    # 【修改】：添加 --inexact，防止已安装包被移除
+    UV_TORCH_BACKEND=auto uv sync --active --inexact $NO_INSTALL_RLINF_CMD
 }
 
 install_flash_attn() {
+    # 【修改】：添加前置检查，已安装则跳过
+    if python -c "import flash_attn" &> /dev/null; then
+        echo "flash-attn 已经安装，跳过重装..."
+        return
+    fi
+
     # Base release info – adjust when bumping flash-attn
     local flash_ver="2.7.4.post1"
     local base_url="${GITHUB_PREFIX}https://github.com/Dao-AILab/flash-attention/releases/download/v${flash_ver}"
@@ -256,6 +263,12 @@ EOF
 }
 
 install_apex() {
+    # 【修改】：添加前置检查，已安装则跳过
+    if python -c "import apex" &> /dev/null; then
+        echo "apex 已经安装，跳过重装..."
+        return
+    fi
+
     # Example URL: https://github.com/RLinf/apex/releases/download/25.09/apex-0.1+torch2.6-cp311-cp311-linux_x86_64.whl
     local base_url="${GITHUB_PREFIX}https://github.com/RLinf/apex/releases/download/25.09"
 
@@ -339,7 +352,8 @@ clone_or_reuse_repo() {
 #=======================EMBODIED INSTALLERS=======================
 
 install_common_embodied_deps() {
-    uv sync --extra embodied --active $NO_INSTALL_RLINF_CMD
+    # 【修改】：添加 --inexact
+    uv sync --extra embodied --active --inexact $NO_INSTALL_RLINF_CMD
     uv pip install -r $SCRIPT_DIR/embodied/envs/common.txt
     if [ "$NO_ROOT" -eq 0 ]; then
         bash $SCRIPT_DIR/embodied/sys_deps.sh
@@ -387,20 +401,6 @@ install_openvla_oft_model() {
             install_common_embodied_deps
             install_maniskill_libero_env
             install_flash_attn
-            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
-            ;;
-        metaworld)
-            create_and_sync_venv
-            install_common_embodied_deps
-            install_flash_attn
-            install_metaworld_env
-            uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
-            ;;
-        calvin)
-            create_and_sync_venv
-            install_common_embodied_deps
-            install_flash_attn
-            install_calvin_env
             uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git  --no-build-isolation
             ;;
         robotwin)
@@ -552,7 +552,8 @@ install_env_only() {
     SKIP_ROS=${SKIP_ROS:-0}
     case "$ENV_NAME" in
         franka)
-            uv sync --extra franka --active $NO_INSTALL_RLINF_CMD
+            # 【修改】：添加 --inexact
+            uv sync --extra franka --active --inexact $NO_INSTALL_RLINF_CMD
             if [ "$SKIP_ROS" -ne 1 ]; then
                 if [ "$NO_ROOT" -eq 0 ]; then
                     bash $SCRIPT_DIR/embodied/ros_install.sh
@@ -561,7 +562,8 @@ install_env_only() {
             fi
             ;;
         xsquare_turtle2)
-            uv sync --extra xsquare_turtle2 --active $NO_INSTALL_RLINF_CMD
+            # 【修改】：添加 --inexact
+            uv sync --extra xsquare_turtle2 --active --inexact $NO_INSTALL_RLINF_CMD
             install_xsquare_turtle2_env
             ;;
         habitat)
@@ -731,33 +733,33 @@ install_robotwin_env() {
     # Adjust some code in wrapper/urdf_loader.py
     URDF_LOADER=$SAPIEN_LOCATION/wrapper/urdf_loader.py
     # ----------- before -----------
-    # 667         with open(urdf_file, "r") as f:
-    # 668             urdf_string = f.read()
+    # 667        with open(urdf_file, "r") as f:
+    # 668            urdf_string = f.read()
     # 669 
-    # 670         if srdf_file is None:
-    # 671             srdf_file = urdf_file[:-4] + "srdf"
-    # 672         if os.path.isfile(srdf_file):
-    # 673             with open(srdf_file, "r") as f:
-    # 674                 self.ignore_pairs = self.parse_srdf(f.read())
+    # 670        if srdf_file is None:
+    # 671            srdf_file = urdf_file[:-4] + "srdf"
+    # 672        if os.path.isfile(srdf_file):
+    # 673            with open(srdf_file, "r") as f:
+    # 674                self.ignore_pairs = self.parse_srdf(f.read())
     # ----------- after  -----------
-    # 667         with open(urdf_file, "r", encoding="utf-8") as f:
-    # 668             urdf_string = f.read()
+    # 667        with open(urdf_file, "r", encoding="utf-8") as f:
+    # 668            urdf_string = f.read()
     # 669 
-    # 670         if srdf_file is None:
-    # 671             srdf_file = urdf_file[:-4] + ".srdf"
-    # 672         if os.path.isfile(srdf_file):
-    # 673             with open(srdf_file, "r", encoding="utf-8") as f:
-    # 674                 self.ignore_pairs = self.parse_srdf(f.read())
+    # 670        if srdf_file is None:
+    # 671            srdf_file = urdf_file[:-4] + ".srdf"
+    # 672        if os.path.isfile(srdf_file):
+    # 673            with open(srdf_file, "r", encoding="utf-8") as f:
+    # 674                self.ignore_pairs = self.parse_srdf(f.read())
     sed -i -E 's/("r")(\))( as)/\1, encoding="utf-8") as/g' $URDF_LOADER
 
     MPLIB_LOCATION=$(uv pip show mplib | grep 'Location' | awk '{print $2}')/mplib
     # Adjust some code in planner.py
     # ----------- before -----------
-    # 807             if np.linalg.norm(delta_twist) < 1e-4 or collide or not within_joint_limit:
-    # 808                 return {"status": "screw plan failed"}
+    # 807            if np.linalg.norm(delta_twist) < 1e-4 or collide or not within_joint_limit:
+    # 808                return {"status": "screw plan failed"}
     # ----------- after  ----------- 
-    # 807             if np.linalg.norm(delta_twist) < 1e-4 or not within_joint_limit:
-    # 808                 return {"status": "screw plan failed"}
+    # 807            if np.linalg.norm(delta_twist) < 1e-4 or not within_joint_limit:
+    # 808                return {"status": "screw plan failed"}
     PLANNER=$MPLIB_LOCATION/planner.py
     sed -i -E 's/(if np.linalg.norm\(delta_twist\) < 1e-4 )(or collide )(or not within_joint_limit:)/\1\3/g' $PLANNER
 }
@@ -810,7 +812,8 @@ install_wan_world_model() {
 #=======================AGENTIC INSTALLER=======================
 
 install_agentic() {
-    uv sync --extra agentic-vllm --active $NO_INSTALL_RLINF_CMD
+    # 【修改】：添加 --inexact
+    uv sync --extra agentic-vllm --active --inexact $NO_INSTALL_RLINF_CMD
     uv sync --extra agentic-sglang --inexact --active $NO_INSTALL_RLINF_CMD
 
     # Megatron-LM
@@ -833,7 +836,8 @@ install_agentic() {
 #=======================DOCUMENTATION INSTALLER=======================
 
 install_docs() {
-    uv sync --extra agentic-vllm --active $NO_INSTALL_RLINF_CMD
+    # 【修改】：添加 --inexact
+    uv sync --extra agentic-vllm --active --inexact $NO_INSTALL_RLINF_CMD
     uv sync --extra agentic-sglang --inexact --active $NO_INSTALL_RLINF_CMD
     uv sync --extra embodied --active --inexact $NO_INSTALL_RLINF_CMD
     uv pip install -r $SCRIPT_DIR/docs/requirements.txt
@@ -894,8 +898,8 @@ main() {
             install_docs
             ;;
         *)
-			echo "Unknown target: $TARGET" >&2
-			echo "Supported targets: ${SUPPORTED_TARGETS[*]}" >&2
+            echo "Unknown target: $TARGET" >&2
+            echo "Supported targets: ${SUPPORTED_TARGETS[*]}" >&2
             exit 1
             ;;
     esac

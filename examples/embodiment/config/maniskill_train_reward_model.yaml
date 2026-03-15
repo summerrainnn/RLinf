@@ -1,0 +1,47 @@
+# Reward model training configuration.
+# This config is used by train_reward_model.py and does NOT require Ray or GPU
+# for the environment — it is a standalone PyTorch training loop.
+#
+# Usage:
+#   bash examples/embodiment/train_reward_model.sh maniskill_train_reward_model
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# Reward model settings
+reward_model:
+  # Pretrained VLM to use as the backbone.
+  # Supported: any HuggingFace Qwen2.5-VL or compatible model.
+  model_path: "/workspace/RLinf/Qwen2-VL-7B-Instruct"
+
+  # Path to the preference dataset produced by collect_preference_data.py
+  data_path: "/workspace/RLinf/data/preference_data/20260313-10:15:02/maniskill_preference.pkl"
+
+  # Where to save training checkpoints
+  output_dir: "/workspace/RLinf/reward_models/maniskill_v2"
+
+  # Training hyperparameters
+  batch_size: 4
+  gradient_accumulation_steps: 2  # effective batch_size = 4 * 2 = 8
+  num_epochs: 20
+  lr: 1.0e-5          # backbone learning rate
+  value_head_lr: 1.0e-4  # value head learning rate (larger, since head is random-init)
+
+  # Backbone freezing / efficient fine-tuning
+  freeze_backbone: false  # set true to train only the value head
+  use_lora: true          # attach LoRA adapters (requires peft package)
+  lora_rank: 16
+  lora_alpha: 32
+
+  # Model architecture
+  hidden_dim: 512  # value head hidden size
+
+  # Misc
+  save_every_n_steps: 100
+  torch_dtype: "bf16"
+  device: "auto"  # "auto" selects CUDA if available
+
+  # Debug: set true to skip model loading and use a zero-output stub
+  use_dummy: false

@@ -30,15 +30,15 @@ from rlinf.scheduler import Channel
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.workers.agent.agent_loop import (
     AgentLoopOutput,
-    MultiAgentLoopOutput,
-    MultiAgentLoopWorker,
+    MultiTurnAgentLoopOutput,
+    MultiTurnAgentLoopWorker,
 )
 
 
-class MasSearchAgentLoopWorker(MultiAgentLoopWorker):
+class MasSearchAgentLoopWorker(MultiTurnAgentLoopWorker):
     """
     Agent loop worker that combines search-r1's <search>keyword</search> extraction
-    logic with multi agent system's component structure.
+    logic with multiturn_demo's component structure.
     """
 
     def __init__(
@@ -216,7 +216,7 @@ class MasSearchAgentLoopWorker(MultiAgentLoopWorker):
         for single_turn_output in output_buffer:
             single_turn_output.reward_score = reward_score
 
-        return MultiAgentLoopOutput(
+        return MultiTurnAgentLoopOutput(
             single_turn_outputs=output_buffer,
             trace_prints=[],
         )

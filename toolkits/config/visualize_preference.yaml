@@ -1,0 +1,10 @@
+# Configuration for visualize_preference_data.py
+#
+# Usage:
+#   python toolkits/visualize_preference_data.py --config toolkits/config/visualize_preference.yaml
+#
+# Or directly:
+#   python toolkits/visualize_preference_data.py --data /path/to/preference.pkl
+
+# Path to the preference data pickle file
+data_path: "/workspace/RLinf/data/preference_data/maniskill_preference.pkl"

@@ -30,10 +30,6 @@ offering practical guidance to help you fully optimize your RL post-training wor
    Introduces how to configure and utilize heterogeneous software and hardware clusters,  
    to fully leverage different types of computing resources and hardware devices.
 
-- :doc:`cloud-edge`
-   Shows how to build a cloud-edge training setup with EasyTier, connect cloud and
-   edge nodes into one overlay network, and run RLinf on top of that topology.
-
 - :doc:`logger`  
    Introduces how to visualize and track key metrics during your training process.  
    Currently, we support three backends for experiment tracking and visualization: 
@@ -50,5 +46,4 @@ offering practical guidance to help you fully optimize your RL post-training wor
    resume
    convertor
    hetero
-   cloud-edge
    logger

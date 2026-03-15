@@ -13,6 +13,7 @@ max_episode_steps: 80 # max episode steps for truncation
 
 video_cfg:
   save_video: False
+  per_env_video: False
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/train
 
@@ -22,7 +23,7 @@ init_params:
   id: PutOnPlateInScene25Main-v3
   num_envs: null # will be set in ManiSkillEnv init
   obs_mode: "rgb+segmentation"
-  control_mode: None
+  control_mode: null
   sim_backend: "gpu"
   sim_config:
     sim_freq: 500
