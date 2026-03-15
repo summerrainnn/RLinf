@@ -52,6 +52,7 @@ from rlinf.data.preference_data import (
     get_keyframes,
     load_preference_pairs,
 )
+from rlinf.data.trajectory_dataset import ScoringResult, TrajectoryDataset
 from rlinf.models.reward_model.vlm_reward_model import build_reward_model
 from rlinf.runners.preference_collection_runner import PreferenceCollectionRunner
 from rlinf.scheduler import Channel
@@ -100,6 +101,7 @@ class RewardModelEvalRunner:
         self.batch_size: int = int(eval_cfg.get("batch_size", 8))
         self.output_path: Optional[str] = eval_cfg.get("output_path", None)
         self.n_keyframes: int = int(eval_cfg.get("n_keyframes", 8))
+        self.eval_data_path: Optional[str] = eval_cfg.get("eval_data_path", None) or None
 
         device_str = eval_cfg.get("device", "auto")
         self.device = (
@@ -164,11 +166,152 @@ class RewardModelEvalRunner:
     # ------------------------------------------------------------------
 
     def run(self) -> dict:
-        """Collect episodes, score with RM, compute pair accuracy, and report.
+        """Collect or load episodes, score with RM, compute pair accuracy.
+
+        If ``eval_data_path`` is set (a ``.json`` TrajectoryDataset), loads
+        data from file and skips rollouts.  Otherwise falls back to the
+        original rollout-based evaluation.
 
         Returns:
             Dict with evaluation metrics.
         """
+        if self.eval_data_path and self.eval_data_path.endswith(".json"):
+            return self._run_from_file()
+        return self._run_from_rollouts()
+
+    # ------------------------------------------------------------------
+    # File-based evaluation (TrajectoryDataset JSON)
+    # ------------------------------------------------------------------
+
+    def _run_from_file(self) -> dict:
+        """Load a TrajectoryDataset, score all trajectories, compute accuracy."""
+        logger.info(f"Loading evaluation data from {self.eval_data_path}")
+        dataset = TrajectoryDataset.load(self.eval_data_path)
+        logger.info(
+            f"Loaded {len(dataset.trajectories)} trajectories, "
+            f"{len(dataset.groups)} groups."
+        )
+        return self._evaluate_dataset(dataset)
+
+    def _evaluate_dataset(self, dataset: TrajectoryDataset) -> dict:
+        """Score all trajectories with RM and compute pairwise accuracy."""
+        # 1. Score all trajectories
+        logger.info("Scoring trajectories with the reward model …")
+        rm_scores = self._score_trajectory_records(dataset.trajectories)
+
+        # 2. Add RM scores as a ScoringResult
+        from pathlib import Path
+
+        rm_scoring = ScoringResult(
+            scorer_name=f"rm_{Path(self.checkpoint_dir).name}",
+            scorer_type="reward_model",
+            model_name=self.model_path,
+            scores={i: s for i, s in enumerate(rm_scores)},
+        )
+        dataset.scoring_results.append(rm_scoring)
+
+        # 3. Save dataset with RM scores
+        if self.output_path:
+            os.makedirs(
+                os.path.dirname(os.path.abspath(self.output_path)), exist_ok=True
+            )
+            dataset.save(self.output_path)
+            logger.info(f"Saved scored dataset to {self.output_path}")
+
+        # 4. Get ground-truth scores
+        gt_scoring = dataset.get_final_scores()
+        if gt_scoring is None:
+            # Fallback to env cumulative reward
+            gt_scoring = ScoringResult(
+                scorer_name="env_cumulative_reward",
+                scorer_type="env_reward",
+                scores={
+                    i: t.cumulative_reward
+                    for i, t in enumerate(dataset.trajectories)
+                    if t.cumulative_reward is not None
+                },
+            )
+
+        # 5. Compute pairwise accuracy
+        metrics = self._compute_group_accuracy(
+            dataset.groups, rm_scoring, gt_scoring
+        )
+        logger.info(
+            f"Reward model evaluation results:\n"
+            f"  Overall pair accuracy: {metrics['pair_accuracy']:.4f} "
+            f"({metrics['num_correct']}/{metrics['num_pairs']})"
+        )
+        return metrics
+
+    @torch.no_grad()
+    def _score_trajectory_records(
+        self, trajectories: list
+    ) -> list[float]:
+        """Score TrajectoryRecord objects with the RM."""
+        all_scores: list[float] = []
+        for start in range(0, len(trajectories), self.batch_size):
+            batch = trajectories[start : start + self.batch_size]
+            episodes = []
+            for t in batch:
+                episodes.append(
+                    EpisodeRecord(
+                        task_description=t.language_instruction,
+                        cumulative_reward=t.cumulative_reward or 0.0,
+                        success=t.success or False,
+                        episode_length=t.episode_length or 0,
+                        video_path=t.video_path,
+                    )
+                )
+            keyframes_list = [
+                get_keyframes(ep, self.n_keyframes) for ep in episodes
+            ]
+            scores = self.reward_model(
+                task_descriptions=[ep.task_description for ep in episodes],
+                keyframes_list=keyframes_list,
+            )
+            all_scores.extend(scores.cpu().float().tolist())
+        return all_scores
+
+    @staticmethod
+    def _compute_group_accuracy(
+        groups: list[list[int]],
+        rm_scoring: ScoringResult,
+        gt_scoring: ScoringResult,
+    ) -> dict:
+        """Compute pairwise accuracy across all groups."""
+        correct = 0
+        total = 0
+        for group in groups:
+            scored = [
+                (idx, rm_scoring.scores.get(idx), gt_scoring.scores.get(idx))
+                for idx in group
+            ]
+            scored = [
+                (idx, rm, gt)
+                for idx, rm, gt in scored
+                if rm is not None and gt is not None
+            ]
+            for i in range(len(scored)):
+                for j in range(i + 1, len(scored)):
+                    if scored[i][2] == scored[j][2]:
+                        continue  # equal ground truth — skip
+                    rm_prefers_i = scored[i][1] > scored[j][1]
+                    gt_prefers_i = scored[i][2] > scored[j][2]
+                    if rm_prefers_i == gt_prefers_i:
+                        correct += 1
+                    total += 1
+        return {
+            "pair_accuracy": correct / total if total > 0 else 0.0,
+            "num_pairs": total,
+            "num_correct": correct,
+        }
+
+    # ------------------------------------------------------------------
+    # Rollout-based evaluation (original behavior)
+    # ------------------------------------------------------------------
+
+    def _run_from_rollouts(self) -> dict:
+        """Original rollout-based evaluation pipeline."""
         # 1. Collect episodes
         logger.info(
             f"Collecting episodes for RM eval: {self.num_eval_epochs} epochs."

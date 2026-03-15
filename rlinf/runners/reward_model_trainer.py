@@ -55,7 +55,14 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
 from rlinf.data.preference_data import PreferencePair, get_keyframes, load_preference_pairs
-from rlinf.models.reward_model.vlm_reward_model import bradley_terry_loss, build_reward_model
+from rlinf.data.trajectory_dataset import ScoringResult, TrajectoryDataset
+from rlinf.models.reward_model.vlm_reward_model import (
+    bradley_terry_loss,
+    build_reward_model,
+    listwise_plackett_luce_loss,
+    margin_bradley_terry_loss,
+    score_regression_loss,
+)
 from rlinf.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -103,6 +110,187 @@ def _collate_fn(batch: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# New-format dataset (TrajectoryDataset JSON)
+# ---------------------------------------------------------------------------
+
+
+class TrajectoryDatasetForRM(Dataset):
+    """PyTorch Dataset that supports both ``.json`` (TrajectoryDataset) and
+    legacy ``.pkl`` (PreferencePair) formats.
+
+    Depending on ``loss_type``, returns pairwise, group-wise, or per-trajectory
+    samples.
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        loss_type: str = "bradley_terry",
+        n_keyframes: int = 8,
+        use_env_reward_as_score: bool = False,
+    ):
+        self._n_keyframes = n_keyframes
+        self.loss_type = loss_type
+
+        if data_path.endswith(".json"):
+            self.dataset = TrajectoryDataset.load(data_path)
+        elif data_path.endswith(".pkl"):
+            pairs = load_preference_pairs(data_path)
+            self.dataset = TrajectoryDataset.from_preference_pairs(pairs)
+        else:
+            raise ValueError(f"Unsupported data format: {data_path}")
+
+        self._init_scoring(use_env_reward_as_score)
+        if loss_type in ("bradley_terry", "margin_bradley_terry"):
+            self._prepare_pairs()
+        elif loss_type == "plackett_luce":
+            self._prepare_groups()
+        elif loss_type == "score_regression":
+            self._prepare_regression()
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    def _init_scoring(self, use_env_reward_as_score: bool) -> None:
+        if use_env_reward_as_score:
+            self.scoring = ScoringResult(
+                scorer_name="env_cumulative_reward",
+                scorer_type="env_reward",
+                scores={
+                    i: t.cumulative_reward
+                    for i, t in enumerate(self.dataset.trajectories)
+                    if t.cumulative_reward is not None
+                },
+            )
+        else:
+            self.scoring = self.dataset.get_final_scores()
+            if self.scoring is None:
+                # fallback to env reward
+                self.scoring = ScoringResult(
+                    scorer_name="env_cumulative_reward",
+                    scorer_type="env_reward",
+                    scores={
+                        i: t.cumulative_reward
+                        for i, t in enumerate(self.dataset.trajectories)
+                        if t.cumulative_reward is not None
+                    },
+                )
+
+    def _prepare_pairs(self) -> None:
+        self.pairs: list[tuple[int, int, float]] = []
+        for group in self.dataset.groups:
+            scored = [
+                (idx, self.scoring.scores.get(idx))
+                for idx in group
+            ]
+            scored = [(idx, s) for idx, s in scored if s is not None]
+            for i in range(len(scored)):
+                for j in range(i + 1, len(scored)):
+                    if scored[i][1] > scored[j][1]:
+                        margin = scored[i][1] - scored[j][1]
+                        self.pairs.append((scored[i][0], scored[j][0], margin))
+                    elif scored[j][1] > scored[i][1]:
+                        margin = scored[j][1] - scored[i][1]
+                        self.pairs.append((scored[j][0], scored[i][0], margin))
+
+    def _prepare_groups(self) -> None:
+        self.group_data: list[tuple[list[int], list[int]]] = []
+        for group in self.dataset.groups:
+            scored = [
+                (idx, self.scoring.scores.get(idx))
+                for idx in group
+            ]
+            scored = [(idx, s) for idx, s in scored if s is not None]
+            if len(scored) < 2:
+                continue
+            scored.sort(key=lambda x: -x[1])
+            indices = [x[0] for x in scored]
+            rankings = list(range(len(scored)))
+            self.group_data.append((indices, rankings))
+
+    def _prepare_regression(self) -> None:
+        self.regression_data: list[tuple[int, float]] = [
+            (idx, score)
+            for idx, score in self.scoring.scores.items()
+            if score is not None
+        ]
+
+    def _get_traj_keyframes(self, idx: int) -> tuple[str, list]:
+        from rlinf.data.preference_data import EpisodeRecord
+
+        t = self.dataset.trajectories[idx]
+        ep = EpisodeRecord(
+            task_description=t.language_instruction,
+            cumulative_reward=t.cumulative_reward or 0.0,
+            success=t.success or False,
+            episode_length=t.episode_length or 0,
+            video_path=t.video_path,
+        )
+        return t.language_instruction, get_keyframes(ep, self._n_keyframes)
+
+    def __len__(self) -> int:
+        if self.loss_type in ("bradley_terry", "margin_bradley_terry"):
+            return len(self.pairs)
+        if self.loss_type == "plackett_luce":
+            return len(self.group_data)
+        return len(self.regression_data)
+
+    def __getitem__(self, idx: int) -> dict:
+        if self.loss_type in ("bradley_terry", "margin_bradley_terry"):
+            chosen_idx, rejected_idx, margin = self.pairs[idx]
+            c_desc, c_kf = self._get_traj_keyframes(chosen_idx)
+            r_desc, r_kf = self._get_traj_keyframes(rejected_idx)
+            return {
+                "chosen_task_desc": c_desc,
+                "chosen_keyframes": c_kf,
+                "rejected_task_desc": r_desc,
+                "rejected_keyframes": r_kf,
+                "margin": margin,
+            }
+        if self.loss_type == "plackett_luce":
+            indices, rankings = self.group_data[idx]
+            descs = []
+            kfs = []
+            for ti in indices:
+                desc, kf = self._get_traj_keyframes(ti)
+                descs.append(desc)
+                kfs.append(kf)
+            return {"task_descs": descs, "keyframes": kfs, "rankings": rankings}
+        # regression
+        traj_idx, target = self.regression_data[idx]
+        desc, kf = self._get_traj_keyframes(traj_idx)
+        return {"task_desc": desc, "keyframes": kf, "target": target}
+
+
+def _collate_pair_fn(batch: list[dict]) -> dict:
+    """Collate for pairwise loss (BT / margin-BT)."""
+    return {
+        "chosen_task_desc": [item["chosen_task_desc"] for item in batch],
+        "chosen_keyframes": [item["chosen_keyframes"] for item in batch],
+        "rejected_task_desc": [item["rejected_task_desc"] for item in batch],
+        "rejected_keyframes": [item["rejected_keyframes"] for item in batch],
+        "margin": torch.tensor(
+            [item["margin"] for item in batch], dtype=torch.float32
+        ),
+    }
+
+
+def _collate_group_fn(batch: list[dict]) -> dict:
+    """Collate for Plackett-Luce loss (variable-size groups → process sequentially)."""
+    return {"groups": batch}
+
+
+def _collate_regression_fn(batch: list[dict]) -> dict:
+    """Collate for regression loss."""
+    return {
+        "task_desc": [item["task_desc"] for item in batch],
+        "keyframes": [item["keyframes"] for item in batch],
+        "target": torch.tensor(
+            [item["target"] for item in batch], dtype=torch.float32
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -133,6 +321,10 @@ class RewardModelTrainer:
         self.save_every_n_steps: int = int(rm_cfg.get("save_every_n_steps", 100))
         self.grad_accum_steps: int = int(rm_cfg.get("gradient_accumulation_steps", 1))
         self.n_keyframes: int = int(rm_cfg.get("n_keyframes", 8))
+        self.loss_type: str = str(rm_cfg.get("loss_type", "bradley_terry"))
+        self.use_env_reward_as_score: bool = bool(
+            rm_cfg.get("use_env_reward_as_score", False)
+        )
 
         dtype_str = rm_cfg.get("torch_dtype", "bf16")
         self.torch_dtype = _parse_dtype(dtype_str)
@@ -202,18 +394,43 @@ class RewardModelTrainer:
     def run(self) -> None:
         """Load dataset, train, and save the final checkpoint."""
         if self.is_main:
-            logger.info(f"Loading preference dataset from {self.data_path}")
-        pairs = load_preference_pairs(self.data_path)
-        if self.is_main:
-            logger.info(f"Loaded {len(pairs)} preference pairs.")
+            logger.info(f"Loading data from {self.data_path}")
 
-        if len(pairs) == 0:
-            raise ValueError("Preference dataset is empty — cannot train.")
+        # Choose dataset class based on file extension
+        if self.data_path.endswith(".json") or self.loss_type != "bradley_terry":
+            dataset = TrajectoryDatasetForRM(
+                data_path=self.data_path,
+                loss_type=self.loss_type,
+                n_keyframes=self.n_keyframes,
+                use_env_reward_as_score=self.use_env_reward_as_score,
+            )
+            if self.loss_type in ("bradley_terry", "margin_bradley_terry"):
+                collate = _collate_pair_fn
+            elif self.loss_type == "plackett_luce":
+                collate = _collate_group_fn
+            elif self.loss_type == "score_regression":
+                collate = _collate_regression_fn
+            else:
+                collate = _collate_pair_fn
+            if self.is_main:
+                logger.info(
+                    f"Using TrajectoryDatasetForRM (loss={self.loss_type}), "
+                    f"{len(dataset)} samples."
+                )
+        else:
+            # Legacy path: pkl with bradley_terry
+            pairs = load_preference_pairs(self.data_path)
+            if self.is_main:
+                logger.info(f"Loaded {len(pairs)} preference pairs (legacy).")
+            if len(pairs) == 0:
+                raise ValueError("Preference dataset is empty — cannot train.")
+            random.shuffle(pairs)
+            dataset = PreferenceDataset(pairs, n_keyframes=self.n_keyframes)
+            collate = _collate_fn
 
-        random.shuffle(pairs)
-        dataset = PreferenceDataset(pairs, n_keyframes=self.n_keyframes)
+        if len(dataset) == 0:
+            raise ValueError("Dataset is empty — cannot train.")
 
-        # Use DistributedSampler for DDP — each GPU gets a different subset
         sampler = (
             DistributedSampler(dataset, num_replicas=self.world_size, rank=self.local_rank)
             if self.distributed
@@ -224,11 +441,10 @@ class RewardModelTrainer:
             batch_size=self.batch_size,
             shuffle=(sampler is None),
             sampler=sampler,
-            collate_fn=_collate_fn,
+            collate_fn=collate,
             drop_last=True,
         )
 
-        # Separate LR for value head vs backbone
         raw = self._raw_model
         backbone_params = list(raw.backbone.parameters())
         vh_params = list(raw.value_head.parameters())
@@ -246,6 +462,7 @@ class RewardModelTrainer:
         if self.is_main:
             logger.info(
                 f"Starting training: {self.num_epochs} epochs, "
+                f"loss_type={self.loss_type}, "
                 f"per-GPU batch_size={self.batch_size}, "
                 f"world_size={self.world_size}, "
                 f"grad_accum={self.grad_accum_steps} "
@@ -260,18 +477,7 @@ class RewardModelTrainer:
             self.model.train()
 
             for micro_step, batch in enumerate(dataloader):
-                # Forward chosen
-                scores_chosen = self.model(
-                    task_descriptions=batch["chosen_task_desc"],
-                    keyframes_list=batch["chosen_keyframes"],
-                )
-                # Forward rejected
-                scores_rejected = self.model(
-                    task_descriptions=batch["rejected_task_desc"],
-                    keyframes_list=batch["rejected_keyframes"],
-                )
-
-                loss = bradley_terry_loss(scores_chosen, scores_rejected)
+                loss = self._compute_loss(batch)
                 loss = loss / self.grad_accum_steps
                 loss.backward()
 
@@ -281,7 +487,6 @@ class RewardModelTrainer:
                     optimizer.zero_grad()
                     global_step += 1
 
-                # Record un-scaled loss for logging
                 loss_val = float(loss.detach().cpu()) * self.grad_accum_steps
                 epoch_losses.append(loss_val)
 
@@ -312,7 +517,6 @@ class RewardModelTrainer:
                     self._raw_model.save_pretrained(best_dir)
                     logger.info(f"New best loss {best_loss:.4f}. Saved to {best_dir}")
 
-        # Save final checkpoint (rank 0 only)
         if self.is_main:
             final_dir = os.path.join(self.output_dir, "final")
             self._raw_model.save_pretrained(final_dir)
@@ -320,6 +524,64 @@ class RewardModelTrainer:
 
         if self.distributed:
             dist.destroy_process_group()
+
+    def _compute_loss(self, batch: dict) -> torch.Tensor:
+        """Compute the training loss based on self.loss_type."""
+        if self.loss_type == "bradley_terry":
+            scores_chosen = self.model(
+                task_descriptions=batch["chosen_task_desc"],
+                keyframes_list=batch["chosen_keyframes"],
+            )
+            scores_rejected = self.model(
+                task_descriptions=batch["rejected_task_desc"],
+                keyframes_list=batch["rejected_keyframes"],
+            )
+            return bradley_terry_loss(scores_chosen, scores_rejected)
+
+        if self.loss_type == "margin_bradley_terry":
+            scores_chosen = self.model(
+                task_descriptions=batch["chosen_task_desc"],
+                keyframes_list=batch["chosen_keyframes"],
+            )
+            scores_rejected = self.model(
+                task_descriptions=batch["rejected_task_desc"],
+                keyframes_list=batch["rejected_keyframes"],
+            )
+            margin = batch["margin"].to(scores_chosen.device)
+            return margin_bradley_terry_loss(scores_chosen, scores_rejected, margin)
+
+        if self.loss_type == "plackett_luce":
+            # Process groups sequentially (variable-size)
+            total_loss = torch.tensor(0.0, device=self.device)
+            n_groups = 0
+            for item in batch["groups"]:
+                descs = item["task_descs"]
+                kfs = item["keyframes"]
+                rankings_list = item["rankings"]
+                scores = self.model(
+                    task_descriptions=descs, keyframes_list=kfs
+                )  # [G]
+                rankings = torch.tensor(
+                    rankings_list, device=scores.device, dtype=torch.long
+                )
+                # listwise loss for one group
+                G = len(scores)
+                order = rankings.argsort()
+                ordered = scores[order]
+                for i in range(G - 1):
+                    total_loss -= ordered[i] - torch.logsumexp(ordered[i:], dim=0)
+                n_groups += 1
+            return total_loss / max(n_groups, 1)
+
+        if self.loss_type == "score_regression":
+            predicted = self.model(
+                task_descriptions=batch["task_desc"],
+                keyframes_list=batch["keyframes"],
+            )
+            target = batch["target"].to(predicted.device)
+            return score_regression_loss(predicted, target)
+
+        raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
 
 # ---------------------------------------------------------------------------

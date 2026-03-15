@@ -483,3 +483,72 @@ def bradley_terry_loss(scores_chosen: torch.Tensor, scores_rejected: torch.Tenso
         Scalar loss (mean over the batch).
     """
     return -F.logsigmoid(scores_chosen - scores_rejected).mean()
+
+
+def margin_bradley_terry_loss(
+    scores_chosen: torch.Tensor,
+    scores_rejected: torch.Tensor,
+    margin: torch.Tensor,
+) -> torch.Tensor:
+    """Bradley-Terry loss with a score-dependent margin.
+
+    Minimises :math:`-\\log \\sigma(r_w - r_l - m)` where *m* is typically the
+    difference between the annotation scores of the chosen and rejected
+    trajectories.
+
+    Args:
+        scores_chosen:   [B] reward scores for preferred trajectories.
+        scores_rejected: [B] reward scores for dis-preferred trajectories.
+        margin:          [B] score margin (e.g. ``label_chosen - label_rejected``).
+
+    Returns:
+        Scalar loss (mean over the batch).
+    """
+    return -F.logsigmoid(scores_chosen - scores_rejected - margin).mean()
+
+
+def listwise_plackett_luce_loss(
+    scores: torch.Tensor,
+    rankings: torch.Tensor,
+) -> torch.Tensor:
+    """Plackett-Luce listwise ranking loss.
+
+    For each group of *G* items, the loss decomposes the ranking probability as
+    a product of successive softmax choices:
+
+    .. math::
+
+        L = -\\sum_{i=0}^{G-2}
+              \\bigl(s_{\\sigma(i)} - \\log \\sum_{j=i}^{G-1} e^{s_{\\sigma(j)}}\\bigr)
+
+    Args:
+        scores:   [B, G] — RM scores for B groups, each with G trajectories.
+        rankings: [B, G] — ranking per item (0 = best, G-1 = worst).
+
+    Returns:
+        Scalar loss (mean over batches and positions).
+    """
+    B, G = scores.shape
+    total_loss = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+    for b in range(B):
+        order = rankings[b].argsort()  # rank → trajectory index
+        ordered = scores[b][order]
+        for i in range(G - 1):
+            total_loss -= ordered[i] - torch.logsumexp(ordered[i:], dim=0)
+    return total_loss / (B * max(G - 1, 1))
+
+
+def score_regression_loss(
+    predicted_scores: torch.Tensor,
+    target_scores: torch.Tensor,
+) -> torch.Tensor:
+    """MSE regression loss for direct score prediction.
+
+    Args:
+        predicted_scores: [B] predicted RM scores.
+        target_scores:    [B] ground-truth annotation scores.
+
+    Returns:
+        Scalar MSE loss.
+    """
+    return F.mse_loss(predicted_scores, target_scores)

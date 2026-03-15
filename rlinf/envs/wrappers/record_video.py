@@ -41,8 +41,18 @@ class RecordVideo(gym.Wrapper):
     5. Per-env video mode: each env writes an independent mp4 (streaming)
     """
 
-    def __init__(self, env: gym.Env, video_cfg, fps: Optional[int] = None):
-        """Initialize the wrapper and set FPS/config."""
+    def __init__(self, env: gym.Env, video_cfg, fps: Optional[int] = None, obs_transform_fn=None):
+        """Initialize the wrapper and set FPS/config.
+
+        Args:
+            env: The environment to wrap.
+            video_cfg: Video configuration dict/DictConfig.
+            fps: Override frames per second.
+            obs_transform_fn: Optional callable ``(obs_dict) -> obs_dict`` that
+                transforms observations before writing to video.  Use this to
+                record what a noised/delayed policy actually sees rather than
+                the raw environment observation.
+        """
         if isinstance(env, gym.Env):
             super().__init__(env)
         else:
@@ -69,6 +79,7 @@ class RecordVideo(gym.Wrapper):
         )
         self._per_env_writers: list[Optional[Any]] = [None] * self._num_envs
         self._per_env_video_paths: list[str] = [""] * self._num_envs
+        self._obs_transform_fn = obs_transform_fn
 
     def _get_fps_from_env(self, env: gym.Env) -> int:
         """Resolve FPS from config/env metadata with fallback."""
@@ -259,7 +270,21 @@ class RecordVideo(gym.Wrapper):
         self.video_cnt += 1
 
     def _write_per_env_frames(self, images: list[np.ndarray]) -> None:
-        """Write one frame per env to their respective streaming writers."""
+        """Write one frame per env to their respective streaming writers.
+
+        If ``obs_transform_fn`` was provided at init time, each frame is
+        transformed before being written.  This allows recording what a
+        noised / delayed policy actually observes.
+        """
+        if self._obs_transform_fn is not None:
+            # Transform expects a dict with image tensors; we wrap/unwrap
+            try:
+                obs = {"main_images": images}
+                obs = self._obs_transform_fn(obs)
+                images = obs.get("main_images", images)
+            except Exception:
+                pass  # Fallback to raw images on any error
+
         for i, img in enumerate(images):
             writer = self._per_env_writers[i]
             if writer is not None and img is not None:

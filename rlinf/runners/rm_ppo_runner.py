@@ -16,7 +16,11 @@ from rlinf.runners.embodied_runner import EmbodiedRunner
 
 
 class EmbodiedRMPPORunner(EmbodiedRunner):
-    """PPO runner that injects reward model scores before advantage computation."""
+    """PPO runner that injects reward model scores before advantage computation.
+
+    Supports multi-checkpoint RM reward injection at intermediate time steps
+    via the ``num_rm_checkpoints`` config key.
+    """
 
     def __init__(self, cfg, actor, rollout, env, critic=None, reward=None, run_timer=None):
         super().__init__(cfg, actor, rollout, env, critic, reward, run_timer)
@@ -31,6 +35,7 @@ class EmbodiedRMPPORunner(EmbodiedRunner):
                 env_reward_weight=self.rm_cfg.get("env_reward_weight", 1.0),
                 env_terminal_reward_weight=self.rm_cfg.get("env_terminal_reward_weight", 0.0),
                 rm_reward_weight=self.rm_cfg.get("rm_reward_weight", 1.0),
+                num_rm_checkpoints=int(self.rm_cfg.get("num_rm_checkpoints", 1)),
             ).wait()
         # rm_results is a list of dicts (one per actor worker), take the first
         self._rm_metrics = {f"rm/{k}": v for k, v in rm_results[0].items()}

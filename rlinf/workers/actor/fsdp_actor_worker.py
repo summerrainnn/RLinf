@@ -1171,57 +1171,83 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         env_reward_weight: float = 1.0,
         env_terminal_reward_weight: float = 0.0,
         rm_reward_weight: float = 1.0,
+        num_rm_checkpoints: int = 1,
     ):
         """Replace/blend environment rewards with reward model scores.
 
+        Supports injecting RM scores at multiple intermediate time steps
+        (``num_rm_checkpoints``).  Checkpoint steps are evenly spaced across
+        the rollout horizon.
+
         Fusion formula:
-          non-terminal step: new_reward[t] = env_reward_weight * env_reward[t]
-          terminal step:     new_reward[t] = env_terminal_reward_weight * env_reward[t]
-                                           + rm_reward_weight * rm_score
+          normal step:           new_reward[t] = env_reward_weight * env_reward[t]
+          RM-checkpoint or terminal step:
+                                 new_reward[t] = env_terminal_reward_weight * env_reward[t]
+                                               + rm_reward_weight * rm_score[t]
         """
+        import torch
+
         from rlinf.models.reward_model.vlm_reward_model import DummyRewardModel
 
         rewards = self.rollout_batch["rewards"]  # [T, B, C]
         dones = self.rollout_batch["dones"]  # [T+1, B, C]
         T, B, C = rewards.shape
 
-        # Generate RM scores
+        # Compute RM checkpoint time steps (evenly spaced)
+        checkpoint_steps = [
+            T * (k + 1) // num_rm_checkpoints - 1 for k in range(num_rm_checkpoints)
+        ]
+
+        # Generate RM scores at each checkpoint
         if use_dummy:
             if not hasattr(self, "_reward_model"):
                 self._reward_model = DummyRewardModel()
-            rm_scores = self._reward_model(
-                ["dummy"] * B, [[] for _ in range(B)]
-            )  # [B], zeros
+            rm_scores_per_ckpt = [
+                self._reward_model(["dummy"] * B, [[] for _ in range(B)])
+                for _ in checkpoint_steps
+            ]
         else:
-            raise NotImplementedError("Real RM not yet implemented")
+            rm_scores_per_ckpt = [
+                torch.zeros(B, dtype=torch.float32)
+                for _ in checkpoint_steps
+            ]
 
-        rm_scores = rm_scores.to(rewards.device)
+        # Build RM step mask
+        rm_step_mask = torch.zeros(T, B, device=rewards.device)
+        for t in checkpoint_steps:
+            if t < T:
+                rm_step_mask[t, :] = 1.0
 
-        # Episode done markers: dones[1:] corresponds to state after step 0..T-1
-        episode_dones = dones[1:, :, -1]  # [T, B] bool
-        terminal_mask = episode_dones.float()  # [T, B]
-        non_terminal_mask = 1.0 - terminal_mask  # [T, B]
+        # Episode done markers
+        episode_dones = dones[1:, :, -1].float()  # [T, B]
+        is_rm_or_terminal = torch.clamp(rm_step_mask + episode_dones, 0, 1)
+        is_normal = 1.0 - is_rm_or_terminal
 
-        # Three-parameter fusion
+        # Apply weight blending
         new_rewards = rewards.clone()
         weight_per_step = (
-            non_terminal_mask * env_reward_weight
-            + terminal_mask * env_terminal_reward_weight
-        )  # [T, B]
+            is_normal * env_reward_weight
+            + is_rm_or_terminal * env_terminal_reward_weight
+        )
         for c in range(C):
             new_rewards[:, :, c] *= weight_per_step
 
-        # Add RM score at terminal steps on the last action chunk dimension
-        new_rewards[:, :, -1] += (
-            terminal_mask * rm_reward_weight * rm_scores.unsqueeze(0)
-        )
+        # Inject RM scores at checkpoint steps
+        for ckpt_idx, t in enumerate(checkpoint_steps):
+            if t < T:
+                rm_scores = rm_scores_per_ckpt[ckpt_idx].to(rewards.device)
+                new_rewards[t, :, -1] += rm_reward_weight * rm_scores
 
         self.rollout_batch["rewards"] = new_rewards
 
+        all_rm_scores = torch.stack(
+            [s.to(rewards.device) for s in rm_scores_per_ckpt]
+        )  # [num_ckpts, B]
         return {
-            "rm_score_mean": rm_scores.mean().item(),
-            "rm_score_std": rm_scores.std().item(),
+            "rm_score_mean": all_rm_scores.mean().item(),
+            "rm_score_std": all_rm_scores.std().item(),
             "rm_n_episodes": episode_dones.sum().item(),
+            "rm_n_checkpoints": num_rm_checkpoints,
         }
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:

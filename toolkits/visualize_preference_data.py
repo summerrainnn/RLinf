@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Web-based visualizer for preference data (.pkl files).
+"""Web-based visualizer for preference / trajectory data.
 
-Launches a Gradio app that you can access from a local browser via SSH port
-forwarding.
+Supports both legacy ``.pkl`` (PreferencePair) and new ``.json``
+(TrajectoryDataset) formats.
 
 Usage::
 
-    # On the remote server:
+    # Legacy pkl format
     python toolkits/visualize_preference_data.py --data path/to/preference.pkl
 
-    # Then on your local machine, forward the port:
-    #   ssh -L 7860:localhost:7860 user@server
-    # Open http://localhost:7860 in your browser.
+    # New JSON format
+    python toolkits/visualize_preference_data.py --data path/to/trajectories.json
 
-    # Or with a YAML config:
+    # With a YAML config
     python toolkits/visualize_preference_data.py --config toolkits/config/visualize_preference.yaml
 """
 
@@ -24,35 +23,23 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
 
-def load_pairs(path: str):
-    project_root = str(Path(__file__).resolve().parent.parent)
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
-    from rlinf.data.preference_data import load_preference_pairs
-
-    return load_preference_pairs(path)
-
-
 def _resolve_video_path(video_path):
-    """Resolve video path, handling container vs host path mapping.
-
-    Video paths stored in preference data may use container paths
-    (``/workspace/RLinf/...``) while the visualizer may run on the host
-    (``~/...``).  This function tries the original path first, then
-    falls back to the mapped host path.
-    """
+    """Resolve video path, handling container vs host path mapping."""
     if not video_path:
         return None
     p = Path(video_path)
     if p.exists():
         return str(p)
-    # Container → host mapping: /workspace/RLinf/ → ~/
     if video_path.startswith("/workspace/RLinf/"):
         host_path = Path.home() / video_path[len("/workspace/RLinf/"):]
         if host_path.exists():
@@ -60,27 +47,68 @@ def _resolve_video_path(video_path):
     return None
 
 
+def load_data(path: str):
+    """Load data and return a TrajectoryDataset (auto-detect format)."""
+    from rlinf.data.trajectory_dataset import TrajectoryDataset
+
+    if path.endswith(".json"):
+        return TrajectoryDataset.load(path)
+
+    # Legacy pkl format
+    from rlinf.data.preference_data import load_preference_pairs
+
+    pairs = load_preference_pairs(path)
+    return TrajectoryDataset.from_preference_pairs(pairs)
+
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Win rate computation
 # ---------------------------------------------------------------------------
 
 
-def _category(pair) -> str:
-    if pair.chosen.success and not pair.rejected.success:
-        return "Success vs Failure"
-    if pair.chosen.success and pair.rejected.success:
-        return "Both Success"
-    if not pair.chosen.success and not pair.rejected.success:
-        return "Both Failure"
-    return "Mixed"
+def compute_winrate(dataset, scorer_name: str) -> dict:
+    """Compute win rate from a dataset using a specific scorer."""
+    scoring = None
+    for sr in dataset.scoring_results:
+        if sr.scorer_name == scorer_name:
+            scoring = sr
+            break
+    if scoring is None:
+        return {"wins": {}, "total": 0}
+
+    models = set(t.model_name for t in dataset.trajectories)
+    wins = {m: 0 for m in models}
+    ties = 0
+    total = 0
+    for group in dataset.groups:
+        if len(group) != 2:
+            continue
+        t0, t1 = dataset.trajectories[group[0]], dataset.trajectories[group[1]]
+        s0 = scoring.scores.get(group[0])
+        s1 = scoring.scores.get(group[1])
+        if s0 is None or s1 is None:
+            continue
+        total += 1
+        if s0 > s1:
+            wins[t0.model_name] = wins.get(t0.model_name, 0) + 1
+        elif s1 > s0:
+            wins[t1.model_name] = wins.get(t1.model_name, 0) + 1
+        else:
+            ties += 1
+    return {"wins": wins, "ties": ties, "total": total}
 
 
-def _cat_short(pair) -> str:
-    if pair.chosen.success and not pair.rejected.success:
+# ---------------------------------------------------------------------------
+# Legacy pair helpers
+# ---------------------------------------------------------------------------
+
+
+def _pair_category(t_chosen, t_rejected) -> str:
+    if t_chosen.success and not t_rejected.success:
         return "SF"
-    if pair.chosen.success and pair.rejected.success:
+    if t_chosen.success and t_rejected.success:
         return "SS"
-    if not pair.chosen.success and not pair.rejected.success:
+    if not t_chosen.success and not t_rejected.success:
         return "FF"
     return "MX"
 
@@ -90,156 +118,227 @@ def _cat_short(pair) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_app(pairs, data_path: str):
-    n_pairs = len(pairs)
+def build_app(dataset, data_path: str):
+    from rlinf.data.trajectory_dataset import TrajectoryDataset
 
-    # Pre-compute list table data
-    table_rows = []
-    for i, p in enumerate(pairs):
-        table_rows.append([
-            i,
-            _cat_short(p),
-            f"{p.reward_margin:+.4f}",
-            f"{p.chosen.cumulative_reward:.4f}",
-            f"{p.rejected.cumulative_reward:.4f}",
-            f"{p.chosen.episode_length}",
-            f"{p.rejected.episode_length}",
+    n_traj = len(dataset.trajectories)
+    n_groups = len(dataset.groups)
+    n_scorings = len(dataset.scoring_results)
+
+    # Gather policy names
+    policy_names = sorted(set(t.model_name for t in dataset.trajectories))
+    policy_counts = {}
+    for t in dataset.trajectories:
+        policy_counts[t.model_name] = policy_counts.get(t.model_name, 0) + 1
+
+    summary = (
+        f"**{Path(data_path).name}** — "
+        f"{n_traj} trajectories, {n_groups} groups, "
+        f"{n_scorings} scoring results, "
+        f"{len(policy_names)} policies"
+    )
+
+    # ---- Overview tab data ----
+    policy_table = [
+        [name, policy_counts[name]] for name in policy_names
+    ]
+
+    # Group table
+    group_table = []
+    for g_idx, group in enumerate(dataset.groups):
+        trajs = [dataset.trajectories[i] for i in group]
+        models = ", ".join(t.model_name for t in trajs)
+        avg_reward = np.mean([
+            t.cumulative_reward for t in trajs if t.cumulative_reward is not None
+        ]) if any(t.cumulative_reward is not None for t in trajs) else float("nan")
+        group_table.append([
+            g_idx, len(group), models,
+            f"{avg_reward:.4f}" if not np.isnan(avg_reward) else "N/A",
         ])
-
-    # Summary text
-    if n_pairs > 0:
-        sf = sum(1 for p in pairs if p.chosen.success and not p.rejected.success)
-        ss = sum(1 for p in pairs if p.chosen.success and p.rejected.success)
-        ff = sum(1 for p in pairs if not p.chosen.success and not p.rejected.success)
-        mx = n_pairs - sf - ss - ff
-        margins = [p.reward_margin for p in pairs]
-        summary = (
-            f"**{Path(data_path).name}** — {n_pairs} pairs  |  "
-            f"SF: {sf}  SS: {ss}  FF: {ff}  Mixed: {mx}  |  "
-            f"Margin: min={min(margins):.4f}  avg={np.mean(margins):.4f}  "
-            f"max={max(margins):.4f}"
-        )
-    else:
-        summary = "No pairs loaded."
 
     # ---- Callbacks ----
 
-    def filter_table(category: str):
-        if category == "All":
-            return table_rows
-        return [r for r in table_rows if r[1] == category]
+    def filter_groups(policy_filter: str):
+        if policy_filter == "All":
+            return group_table
+        return [r for r in group_table if policy_filter in r[2]]
 
-    def show_pair(pair_idx):
-        if pair_idx is None:
-            return "Select a pair.", None, None
-        pair_idx = int(pair_idx)
-        if pair_idx < 0 or pair_idx >= n_pairs:
-            return "Invalid index.", None, None
+    def show_group(group_idx):
+        if group_idx is None:
+            return "Select a group.", []
+        group_idx = int(group_idx)
+        if group_idx < 0 or group_idx >= n_groups:
+            return "Invalid group index.", []
+        group = dataset.groups[group_idx]
+        trajs = [dataset.trajectories[i] for i in group]
 
-        pair = pairs[pair_idx]
-        c = pair.chosen
-        r = pair.rejected
+        lines = [f"### Group #{group_idx} ({len(group)} trajectories)\n"]
+        lines.append(f"**Task:** {trajs[0].language_instruction}\n")
+        lines.append("| # | Model | Reward | Length | Success | Seed |")
+        lines.append("|---|-------|--------|--------|---------|------|")
+        for i, t in enumerate(trajs):
+            lines.append(
+                f"| {i + 1} | {t.model_name} | "
+                f"{t.cumulative_reward if t.cumulative_reward is not None else 'N/A'} | "
+                f"{t.episode_length or 'N/A'} | {t.success} | {t.env_seed} |"
+            )
 
-        # Resolve video paths (handle container vs host)
-        c_video = _resolve_video_path(c.video_path)
-        r_video = _resolve_video_path(r.video_path)
+        # Show scores if available
+        for sr in dataset.scoring_results:
+            scored_in_group = {
+                i: sr.scores.get(idx)
+                for i, idx in enumerate(group)
+                if idx in sr.scores
+            }
+            if scored_in_group:
+                persp = f" ({sr.perspective_name})" if sr.perspective_name else ""
+                lines.append(
+                    f"\n**Scores from {sr.scorer_name}{persp}:** "
+                    + ", ".join(
+                        f"T{i + 1}={v}" for i, v in sorted(scored_in_group.items())
+                    )
+                )
 
-        c_source = "video" if c_video else ("missing" if c.video_path else "no video")
-        r_source = "video" if r_video else ("missing" if r.video_path else "no video")
+        info_md = "\n".join(lines)
 
-        info_md = (
-            f"### Pair #{pair_idx}\n\n"
-            f"**Task:** {c.task_description}\n\n"
-            f"**Category:** {_category(pair)}  |  "
-            f"**Reward margin:** {pair.reward_margin:.4f}\n\n"
-            f"| | Reward | Length | Success | Source |\n"
-            f"|---|---|---|---|---|\n"
-            f"| **Chosen** | {c.cumulative_reward:.4f} | {c.episode_length} "
-            f"| {c.success} | {c_source} |\n"
-            f"| **Rejected** | {r.cumulative_reward:.4f} | {r.episode_length} "
-            f"| {r.success} | {r_source} |\n"
-        )
+        videos = []
+        for t in trajs:
+            vp = _resolve_video_path(t.video_path)
+            if vp:
+                videos.append(vp)
 
-        return info_md, c_video, r_video
+        return info_md, videos
+
+    def compute_stats():
+        """Generate statistics text."""
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        lines = ["## Statistics\n"]
+
+        # Policy distribution
+        lines.append("### Policy Distribution\n")
+        for name in policy_names:
+            pct = policy_counts[name] / n_traj * 100
+            lines.append(f"- **{name}**: {policy_counts[name]} ({pct:.1f}%)")
+
+        # Success rate by policy
+        lines.append("\n### Success Rate by Policy\n")
+        for name in policy_names:
+            p_trajs = [t for t in dataset.trajectories if t.model_name == name]
+            successes = sum(1 for t in p_trajs if t.success is True)
+            total = len(p_trajs)
+            rate = successes / total * 100 if total > 0 else 0
+            lines.append(f"- **{name}**: {successes}/{total} ({rate:.1f}%)")
+
+        # Scoring results summary
+        if dataset.scoring_results:
+            lines.append("\n### Scoring Results\n")
+            for sr in dataset.scoring_results:
+                valid_scores = [
+                    v for v in sr.scores.values() if v is not None
+                ]
+                persp = f" [{sr.perspective_name}]" if sr.perspective_name else ""
+                if valid_scores:
+                    lines.append(
+                        f"- **{sr.scorer_name}**{persp} ({sr.scorer_type}): "
+                        f"{len(valid_scores)} scored, "
+                        f"mean={np.mean(valid_scores):.3f}, "
+                        f"std={np.std(valid_scores):.3f}"
+                    )
+
+        # Win rate (if 2-model groups)
+        model_set = set(t.model_name for t in dataset.trajectories)
+        if len(model_set) == 2 and dataset.scoring_results:
+            lines.append("\n### Win Rate\n")
+            for sr in dataset.scoring_results:
+                if sr.perspective_name is not None:
+                    continue
+                wr = compute_winrate(dataset, sr.scorer_name)
+                if wr["total"] > 0:
+                    lines.append(f"**{sr.scorer_name}** ({wr['total']} matchups):")
+                    for model, w in wr["wins"].items():
+                        rate = w / wr["total"] * 100
+                        lines.append(f"  - {model}: {w} wins ({rate:.1f}%)")
+                    lines.append(f"  - Ties: {wr.get('ties', 0)}")
+
+        # Score distribution plot
+        fig = None
+        overall_sr = dataset.get_final_scores()
+        if overall_sr:
+            valid = [v for v in overall_sr.scores.values() if v is not None]
+            if valid:
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.hist(valid, bins=20, alpha=0.7, edgecolor="black")
+                ax.set_xlabel("Score")
+                ax.set_ylabel("Count")
+                ax.set_title(f"Score Distribution ({overall_sr.scorer_name})")
+                plt.tight_layout()
+
+        return "\n".join(lines), fig
 
     def on_table_select(evt: gr.SelectData, current_filter: str):
+        filtered = filter_groups(current_filter)
         row = evt.index[0]
-        filtered = filter_table(current_filter)
         if row < len(filtered):
             return int(filtered[row][0])
         return 0
 
     # ---- Layout ----
 
-    with gr.Blocks(title="Preference Data Viewer") as app:
-        gr.Markdown(f"## Preference Data Viewer\n{summary}")
+    with gr.Blocks(title="Trajectory Data Viewer") as app:
+        gr.Markdown(f"## Trajectory Data Viewer\n{summary}")
 
-        with gr.Row():
-            # Left column: list
-            with gr.Column(scale=1, min_width=420):
-                filter_state = gr.Radio(
-                    ["All", "SF", "SS", "FF", "MX"],
-                    value="All",
-                    label="Filter by category",
-                )
-                pair_table = gr.Dataframe(
-                    value=table_rows,
-                    headers=[
-                        "#", "Cat", "Margin", "Chosen R",
-                        "Rejected R", "C Len", "R Len",
-                    ],
-                    datatype=[
-                        "number", "str", "str", "str", "str", "str", "str",
-                    ],
-                    interactive=False,
-                    max_height=600,
-                )
-                pair_idx_input = gr.Number(
-                    value=0,
-                    label="Pair index (type or click table row)",
-                    precision=0,
-                )
-
-            # Right column: detail
-            with gr.Column(scale=2):
-                info_display = gr.Markdown(
-                    "Select a pair from the table or enter an index."
-                )
-
+        with gr.Tabs():
+            # Tab 1: Group Browser
+            with gr.TabItem("Groups"):
                 with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("#### Chosen Episode")
-                        chosen_video = gr.Video(
-                            label="Chosen",
-                            height=360,
-                            interactive=False,
+                    with gr.Column(scale=1, min_width=450):
+                        filter_dropdown = gr.Dropdown(
+                            choices=["All"] + policy_names,
+                            value="All",
+                            label="Filter by policy",
                         )
-                    with gr.Column():
-                        gr.Markdown("#### Rejected Episode")
-                        rejected_video = gr.Video(
-                            label="Rejected",
-                            height=360,
+                        grp_table = gr.Dataframe(
+                            value=group_table,
+                            headers=["#", "Size", "Models", "Avg Reward"],
+                            datatype=["number", "number", "str", "str"],
                             interactive=False,
+                            max_height=600,
+                        )
+                        group_idx_input = gr.Number(
+                            value=0, label="Group index", precision=0,
                         )
 
-        # Wire events
-        all_outputs = [info_display, chosen_video, rejected_video]
+                    with gr.Column(scale=2):
+                        info_display = gr.Markdown("Select a group.")
+                        video_gallery = gr.Gallery(
+                            label="Trajectory Videos", columns=4, height=400,
+                        )
 
-        filter_state.change(
-            fn=filter_table, inputs=[filter_state], outputs=[pair_table]
-        )
+                filter_dropdown.change(
+                    fn=filter_groups, inputs=[filter_dropdown], outputs=[grp_table]
+                )
+                grp_table.select(
+                    fn=on_table_select,
+                    inputs=[filter_dropdown],
+                    outputs=[group_idx_input],
+                )
+                group_idx_input.change(
+                    fn=show_group,
+                    inputs=[group_idx_input],
+                    outputs=[info_display, video_gallery],
+                )
 
-        pair_table.select(
-            fn=on_table_select,
-            inputs=[filter_state],
-            outputs=[pair_idx_input],
-        )
-
-        pair_idx_input.change(
-            fn=show_pair,
-            inputs=[pair_idx_input],
-            outputs=all_outputs,
-        )
+            # Tab 2: Statistics
+            with gr.TabItem("Statistics"):
+                stats_btn = gr.Button("Compute Statistics")
+                stats_md = gr.Markdown()
+                stats_plot = gr.Plot(label="Score Distribution")
+                stats_btn.click(
+                    fn=compute_stats, outputs=[stats_md, stats_plot]
+                )
 
     return app
 
@@ -251,9 +350,11 @@ def build_app(pairs, data_path: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Web-based preference data visualizer"
+        description="Web-based preference / trajectory data visualizer"
     )
-    parser.add_argument("--data", type=str, help="Path to preference .pkl file")
+    parser.add_argument(
+        "--data", type=str, help="Path to .pkl or .json data file"
+    )
     parser.add_argument("--config", type=str, help="Path to YAML config file")
     parser.add_argument(
         "--port", type=int, default=7860,
@@ -272,11 +373,14 @@ def main():
     if not data_path:
         parser.error("Must provide --data or --config with data_path")
 
-    print(f"Loading preference data from: {data_path}")
-    pairs = load_pairs(data_path)
-    print(f"Loaded {len(pairs)} preference pairs.")
+    print(f"Loading data from: {data_path}")
+    dataset = load_data(data_path)
+    print(
+        f"Loaded {len(dataset.trajectories)} trajectories, "
+        f"{len(dataset.groups)} groups."
+    )
 
-    app = build_app(pairs, data_path)
+    app = build_app(dataset, data_path)
     print(f"\nStarting server on port {args.port}.")
     print(
         f"Access via SSH port forwarding:  "
