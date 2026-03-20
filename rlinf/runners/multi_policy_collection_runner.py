@@ -118,11 +118,14 @@ class MultiPolicyCollectionRunner:
             assignments.append([self.policies[i] for i in indices])
         return assignments
 
-    def _run_collection_epoch(self) -> tuple[list[dict], list[list[dict]]]:
+    def _run_collection_epoch(
+        self, env_seeds: list[int] | None = None
+    ) -> tuple[list[dict], list[list[dict]]]:
         """Run one rollout epoch and return env results + rollout results."""
         env_handle: Handle = self.env.collect_preference_epoch(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
+            env_seeds=env_seeds,
         )
         rollout_handle: Handle = self.rollout.collect_episodes_epoch(
             input_channel=self.env_channel,
@@ -143,6 +146,7 @@ class MultiPolicyCollectionRunner:
     ) -> list[TrajectoryRecord]:
         """Convert one epoch's results into TrajectoryRecords."""
         all_records: list[TrajectoryRecord] = []
+        seed_offset = 0
         for env_result, raw_obs in zip(env_results_list, raw_obs_list):
             if env_result is None or raw_obs is None:
                 continue
@@ -156,10 +160,12 @@ class MultiPolicyCollectionRunner:
             rewards = env_result["rewards"]
             successes = env_result["successes"]
             lengths = env_result["lengths"]
+            first_success_steps_arr = env_result.get("first_success_steps", None)
 
             n_envs = len(task_descriptions)
             for i in range(n_envs):
-                seed = env_seeds[i] if i < len(env_seeds) else 0
+                global_i = seed_offset + i
+                seed = env_seeds[global_i] if global_i < len(env_seeds) else 0
                 vp = video_paths[i] if i < len(video_paths) else None
                 ep_len = int(lengths[i]) if i < len(lengths) else self.max_steps
 
@@ -171,8 +177,15 @@ class MultiPolicyCollectionRunner:
                     except Exception:
                         pass
 
+                # Determine first_success_step for this env
+                first_success_step = None
+                if first_success_steps_arr is not None and i < len(first_success_steps_arr):
+                    fss = int(first_success_steps_arr[i])
+                    if fss >= 0:
+                        first_success_step = fss
+
                 record = TrajectoryRecord(
-                    video_path=vp if vp else None,
+                    video_path=vp if vp and os.path.exists(vp) else None,
                     model_name=policy_name,
                     chunk_size=chunk_size,
                     start_step=0,
@@ -182,9 +195,11 @@ class MultiPolicyCollectionRunner:
                     language_instruction=task_descriptions[i],
                     success=bool(successes[i]),
                     episode_length=ep_len,
+                    first_success_step=first_success_step,
                     smoothness=smoothness,
                 )
                 all_records.append(record)
+            seed_offset += n_envs
         return all_records
 
     def run(self) -> None:
@@ -222,6 +237,45 @@ class MultiPolicyCollectionRunner:
                 f"(type={policy_cfg.get('type', 'checkpoint')})"
             )
 
+            # Set per-policy temperature on the rollout worker
+            temperature = float(policy_cfg.get("temperature", 1.0))
+            self.rollout.set_collection_temperature(temperature).wait()
+
+            # Load checkpoint weights if model_path is specified
+            model_path = policy_cfg.get("model_path")
+            model_type = policy_cfg.get("model_type")
+            if model_path:
+                # Extract model_config_overrides from the policy definition.
+                # Keys that are not part of the runner-level policy schema are
+                # forwarded as model config overrides (e.g. trust_remote_code,
+                # max_prompt_length needed by openvla_oft).
+                _policy_meta_keys = {
+                    "name", "type", "model_type", "model_path",
+                    "weight", "temperature", "env_name",
+                    "noise_std", "delay_steps",
+                }
+                model_config_overrides = {
+                    k: v for k, v in policy_cfg.items()
+                    if k not in _policy_meta_keys
+                } or None
+                self.rollout.load_policy_for_model_type(
+                    str(model_path), model_type, model_config_overrides
+                ).wait()
+
+            # Apply wrapper (or clear existing one)
+            ptype = policy_cfg.get("type", "checkpoint")
+            wrapper_type = ptype if ptype != "checkpoint" else None
+            wrapper_params: dict = {}
+            if ptype == "action_noise":
+                wrapper_params["noise_std"] = float(policy_cfg["noise_std"])
+            elif ptype == "perception_noise":
+                wrapper_params["noise_std"] = float(policy_cfg["noise_std"])
+            elif ptype == "action_delay":
+                wrapper_params["delay_steps"] = int(policy_cfg["delay_steps"])
+            self.rollout.apply_policy_wrapper(
+                wrapper_type, wrapper_params if wrapper_params else None
+            ).wait()
+
             # Batch jobs into epochs of n_envs
             for batch_start in range(0, len(jobs), n_envs):
                 batch = jobs[batch_start : batch_start + n_envs]
@@ -231,7 +285,9 @@ class MultiPolicyCollectionRunner:
                 while len(batch_seeds) < n_envs:
                     batch_seeds.append(batch_seeds[-1])
 
-                env_results_list, raw_obs_list = self._run_collection_epoch()
+                env_results_list, raw_obs_list = self._run_collection_epoch(
+                    env_seeds=batch_seeds,
+                )
 
                 records = self._build_records_from_epoch(
                     env_results_list,
@@ -260,14 +316,10 @@ class MultiPolicyCollectionRunner:
                     (record.cumulative_reward or 0.0) / self.num_segments
                 ] * self.num_segments
                 seg_smoothness = [record.smoothness or 0.5] * self.num_segments
-                try:
-                    segments = split_trajectory(
-                        record, seg_rewards, seg_smoothness, self.num_segments
-                    )
-                    segmented_records.extend(segments)
-                except Exception as e:
-                    logger.warning(f"Failed to split trajectory: {e}")
-                    segmented_records.append(record)
+                segments = split_trajectory(
+                    record, seg_rewards, seg_smoothness, self.num_segments
+                )
+                segmented_records.extend(segments)
             all_records = segmented_records
 
         # Group by (env_seed, start_step)

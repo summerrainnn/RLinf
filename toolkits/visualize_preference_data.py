@@ -20,7 +20,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import gradio as gr
 import numpy as np
 
 _project_root = str(Path(__file__).resolve().parent.parent)
@@ -119,6 +118,7 @@ def _pair_category(t_chosen, t_rejected) -> str:
 
 
 def build_app(dataset, data_path: str):
+    import gradio as gr
     from rlinf.data.trajectory_dataset import TrajectoryDataset
 
     n_traj = len(dataset.trajectories)
@@ -360,6 +360,17 @@ def main():
         "--port", type=int, default=7860,
         help="Port to serve on (default: 7860)",
     )
+    parser.add_argument(
+        "--save-only",
+        action="store_true",
+        help="Save summary plots as PNG files and exit (no Gradio server)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="preference_data.png",
+        help="Output path prefix for saved plots (used with --save-only)",
+    )
     args = parser.parse_args()
 
     data_path = args.data
@@ -379,6 +390,112 @@ def main():
         f"Loaded {len(dataset.trajectories)} trajectories, "
         f"{len(dataset.groups)} groups."
     )
+
+    # --- Save-only mode ---
+    if args.save_only:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        output_base = Path(args.output)
+        output_dir = output_base.parent
+        stem = output_base.stem
+        suffix = output_base.suffix or ".png"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        n_traj = len(dataset.trajectories)
+
+        # Gather policy names
+        policy_names = sorted(set(t.model_name for t in dataset.trajectories))
+        policy_counts = {}
+        for t in dataset.trajectories:
+            policy_counts[t.model_name] = policy_counts.get(t.model_name, 0) + 1
+
+        # 1. Policy distribution bar chart
+        fig1, ax1 = plt.subplots(figsize=(10, 5))
+        ax1.bar(policy_names, [policy_counts[n] for n in policy_names], alpha=0.7)
+        ax1.set_xlabel("Policy")
+        ax1.set_ylabel("Count")
+        ax1.set_title("Policy Distribution")
+        plt.tight_layout()
+        p1 = output_dir / f"{stem}_policy_dist{suffix}"
+        fig1.savefig(str(p1), dpi=200, bbox_inches="tight")
+        plt.close(fig1)
+        print(f"Saved policy distribution to {p1}")
+
+        # 2. Reward distribution histogram
+        rewards = [
+            t.cumulative_reward
+            for t in dataset.trajectories
+            if t.cumulative_reward is not None
+        ]
+        if rewards:
+            fig2, ax2 = plt.subplots(figsize=(10, 5))
+            ax2.hist(rewards, bins=20, alpha=0.7, edgecolor="black")
+            ax2.set_xlabel("Cumulative Reward")
+            ax2.set_ylabel("Count")
+            ax2.set_title("Reward Distribution")
+            plt.tight_layout()
+            p2 = output_dir / f"{stem}_reward_dist{suffix}"
+            fig2.savefig(str(p2), dpi=200, bbox_inches="tight")
+            plt.close(fig2)
+            print(f"Saved reward distribution to {p2}")
+
+        # 3. Success rate by policy
+        fig3, ax3 = plt.subplots(figsize=(10, 5))
+        success_rates = []
+        for name in policy_names:
+            p_trajs = [t for t in dataset.trajectories if t.model_name == name]
+            successes = sum(1 for t in p_trajs if t.success is True)
+            total = len(p_trajs)
+            rate = successes / total * 100 if total > 0 else 0
+            success_rates.append(rate)
+        ax3.bar(policy_names, success_rates, alpha=0.7, color="green")
+        ax3.set_xlabel("Policy")
+        ax3.set_ylabel("Success Rate (%)")
+        ax3.set_title("Success Rate by Policy")
+        ax3.set_ylim(0, 105)
+        plt.tight_layout()
+        p3 = output_dir / f"{stem}_success_rate{suffix}"
+        fig3.savefig(str(p3), dpi=200, bbox_inches="tight")
+        plt.close(fig3)
+        print(f"Saved success rate to {p3}")
+
+        # 4. Score distribution (if scoring results exist)
+        overall_sr = dataset.get_final_scores()
+        if overall_sr:
+            valid = [v for v in overall_sr.scores.values() if v is not None]
+            if valid:
+                fig4, ax4 = plt.subplots(figsize=(8, 4))
+                ax4.hist(valid, bins=20, alpha=0.7, edgecolor="black")
+                ax4.set_xlabel("Score")
+                ax4.set_ylabel("Count")
+                ax4.set_title(f"Score Distribution ({overall_sr.scorer_name})")
+                plt.tight_layout()
+                p4 = output_dir / f"{stem}_score_dist{suffix}"
+                fig4.savefig(str(p4), dpi=200, bbox_inches="tight")
+                plt.close(fig4)
+                print(f"Saved score distribution to {p4}")
+
+        # Print text summary
+        print(f"\n--- Summary ---")
+        print(f"File: {Path(data_path).name}")
+        print(f"Trajectories: {n_traj}")
+        print(f"Groups: {len(dataset.groups)}")
+        print(f"Scoring results: {len(dataset.scoring_results)}")
+        print(f"Policies: {len(policy_names)}")
+        for name in policy_names:
+            p_trajs = [t for t in dataset.trajectories if t.model_name == name]
+            successes = sum(1 for t in p_trajs if t.success is True)
+            total = len(p_trajs)
+            rate = successes / total * 100 if total > 0 else 0
+            print(f"  {name}: {total} trajectories, {rate:.1f}% success")
+
+        print("\nDone (save-only mode).")
+        return
+
+    # --- Gradio mode ---
+    import gradio as gr  # noqa: F811
 
     app = build_app(dataset, data_path)
     print(f"\nStarting server on port {args.port}.")

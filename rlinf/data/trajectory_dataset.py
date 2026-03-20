@@ -5,10 +5,13 @@ and backward compatibility with the legacy PreferencePair format.
 """
 
 import json
+import logging
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Union
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -25,6 +28,7 @@ class TrajectoryRecord:
     language_instruction: str
     success: Optional[bool] = None
     episode_length: Optional[int] = None
+    first_success_step: Optional[int] = None
     smoothness: Optional[float] = None
     quality_metrics: Optional[dict] = None
     quality_score: Optional[float] = None
@@ -280,14 +284,28 @@ def split_video_file(video_path: str, num_segments: int, fps: int = 5) -> list[s
 
     Returns:
         List of output segment file paths.
+
+    Raises:
+        FileNotFoundError: if *video_path* does not exist.
+        ValueError: if the video contains fewer frames than *num_segments*.
     """
+    import os
+
     import imageio
+
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
 
     reader = imageio.get_reader(video_path)
     try:
         frames = list(reader)
     finally:
         reader.close()
+
+    if len(frames) < num_segments:
+        raise ValueError(
+            f"Video has {len(frames)} frames, fewer than {num_segments} segments"
+        )
 
     seg_size = len(frames) // num_segments
     paths: list[str] = []
@@ -313,6 +331,10 @@ def split_trajectory(
 ) -> list[TrajectoryRecord]:
     """Split a full trajectory into segments.
 
+    Video splitting is best-effort: if the video file cannot be read or
+    split, the trajectory metadata is still segmented correctly and the
+    original video path is assigned to the first segment.
+
     Args:
         record: the original TrajectoryRecord.
         segment_rewards: per-segment cumulative reward, length = num_segments.
@@ -324,11 +346,23 @@ def split_trajectory(
         List of TrajectoryRecord, one per segment.
     """
     total_steps = record.end_step - record.start_step + 1
+    if total_steps < num_segments:
+        logger.warning(
+            f"Trajectory has {total_steps} steps, fewer than {num_segments} "
+            f"segments — returning unsplit record"
+        )
+        return [record]
+
     seg_length = total_steps // num_segments
 
     seg_video_paths: list[Optional[str]] = [None] * num_segments
     if record.video_path:
-        seg_video_paths = split_video_file(record.video_path, num_segments, fps)
+        try:
+            seg_video_paths = split_video_file(record.video_path, num_segments, fps)
+        except Exception as e:
+            logger.debug(f"Could not split video {record.video_path}: {e}")
+            # Keep the original video path for the first segment only
+            seg_video_paths = [record.video_path] + [None] * (num_segments - 1)
 
     segments: list[TrajectoryRecord] = []
     for i in range(num_segments):

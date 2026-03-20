@@ -14,6 +14,8 @@
 
 import copy
 import gc
+import glob
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -108,6 +110,12 @@ class MultiStepRolloutWorker(Worker):
 
         self.hf_model.eval()
 
+        # Track base model and current checkpoint/model_type for policy switching
+        self._base_model = self.hf_model
+        self._current_model_path: str = str(self.cfg.rollout.model.model_path)
+        self._current_model_type: str = str(self.cfg.actor.model.model_type)
+        self._base_model_config = rollout_model_config
+
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
                 "torch_compile_mode", "max-autotune-no-cudagraphs"
@@ -172,6 +180,159 @@ class MultiStepRolloutWorker(Worker):
             "max_new_tokens": self._length_params["max_new_token"],
         }
 
+        # Per-policy temperature for data collection (default: no scaling)
+        self._collection_temperature: float = 1.0
+
+    def set_collection_temperature(self, temperature: float) -> None:
+        """Set the temperature used for flow-model noise scaling during collection."""
+        self._collection_temperature = temperature
+
+    def load_policy_checkpoint(self, model_path: str) -> None:
+        """Load model weights from a checkpoint path.
+
+        Supports FSDP checkpoint format (``full_weights.pt``) and safetensors
+        format.  Skips reloading if *model_path* matches the currently loaded
+        checkpoint.
+
+        Args:
+            model_path: Path to the checkpoint directory.
+        """
+        if model_path == self._current_model_path:
+            self.log_info(f"Checkpoint already loaded: {model_path}")
+            return
+
+        # Ensure we operate on the base (unwrapped) model
+        self.hf_model = self._base_model
+
+        full_weights_path = os.path.join(
+            model_path, "model_state_dict", "full_weights.pt"
+        )
+        actor_full_weights_path = os.path.join(
+            model_path, "actor", "model_state_dict", "full_weights.pt"
+        )
+
+        if os.path.exists(full_weights_path):
+            self.log_info(f"Loading FSDP checkpoint: {full_weights_path}")
+            state_dict = torch.load(full_weights_path, map_location="cpu")
+            self.hf_model.load_state_dict(state_dict, strict=False)
+            del state_dict
+        elif os.path.exists(actor_full_weights_path):
+            self.log_info(f"Loading FSDP actor checkpoint: {actor_full_weights_path}")
+            state_dict = torch.load(actor_full_weights_path, map_location="cpu")
+            self.hf_model.load_state_dict(state_dict, strict=False)
+            del state_dict
+        else:
+            import safetensors.torch
+
+            weight_paths = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+            if not weight_paths:
+                weight_paths = [os.path.join(model_path, "model.safetensors")]
+            self.log_info(
+                f"Loading safetensors checkpoint: {weight_paths}"
+            )
+            for weight_path in weight_paths:
+                safetensors.torch.load_model(
+                    self.hf_model, weight_path, strict=False
+                )
+
+        self.hf_model.to(self.device)
+        self.hf_model.eval()
+        self._current_model_path = model_path
+        gc.collect()
+        self.torch_platform.empty_cache()
+        self.log_info(f"Policy checkpoint loaded: {model_path}")
+
+    def load_policy_for_model_type(
+        self,
+        model_path: str,
+        model_type: str | None = None,
+        model_config_overrides: dict | None = None,
+    ) -> None:
+        """Load a policy checkpoint, rebuilding the model if the architecture changed.
+
+        When *model_type* differs from the currently loaded model type (e.g.
+        switching between ``"openpi"`` and ``"openvla_oft"``), the old model is
+        destroyed and a new one is created via the model factory.  When
+        *model_type* is ``None`` or matches the current type, this falls back to
+        :meth:`load_policy_checkpoint` which only swaps weights.
+
+        Args:
+            model_path: Path to the checkpoint directory.
+            model_type: The ``model_type`` string (e.g. ``"openpi"``,
+                ``"openvla_oft"``).  ``None`` means same as the current type.
+            model_config_overrides: Additional model config fields to merge when
+                rebuilding the model (e.g. ``{"trust_remote_code": True}``).
+                Only used when the model type actually changes.
+        """
+        if model_type is None or model_type == self._current_model_type:
+            # Same architecture -- weight swap is sufficient.
+            self.load_policy_checkpoint(model_path)
+            return
+
+        if model_path == self._current_model_path and model_type == self._current_model_type:
+            self.log_info(
+                f"Model already loaded: {model_path} (type={model_type})"
+            )
+            return
+
+        self.log_info(
+            f"Model type changed from '{self._current_model_type}' to "
+            f"'{model_type}'. Rebuilding model from {model_path}."
+        )
+
+        # Tear down old model to free GPU memory.
+        del self.hf_model
+        del self._base_model
+        gc.collect()
+        self.torch_platform.empty_cache()
+
+        # Build a new model config with the target model_type and model_path.
+        new_model_config = copy.deepcopy(self._base_model_config)
+        with open_dict(new_model_config):
+            new_model_config.model_type = model_type
+            new_model_config.model_path = model_path
+            # Merge any extra model config fields needed by the target architecture.
+            if model_config_overrides:
+                for key, val in model_config_overrides.items():
+                    new_model_config[key] = val
+
+        self.hf_model = get_model(new_model_config)
+        self.hf_model.eval()
+
+        self._base_model = self.hf_model
+        self._current_model_path = model_path
+        self._current_model_type = model_type
+        gc.collect()
+        self.torch_platform.empty_cache()
+        self.log_info(
+            f"Model rebuilt for type '{model_type}' from {model_path}."
+        )
+
+    def apply_policy_wrapper(
+        self,
+        wrapper_type: str | None,
+        wrapper_params: dict | None = None,
+    ) -> None:
+        """Apply or clear a policy wrapper on the base model.
+
+        Args:
+            wrapper_type: One of ``"action_noise"``, ``"perception_noise"``,
+                ``"action_delay"``, or ``None`` to clear any wrapper.
+            wrapper_params: Keyword arguments forwarded to the wrapper
+                constructor (e.g. ``{"noise_std": 0.05}``).
+        """
+        from rlinf.models.embodiment.policy_wrappers import create_policy_wrapper
+
+        # Always restore to unwrapped base model first
+        self.hf_model = self._base_model
+        self.hf_model = create_policy_wrapper(
+            self.hf_model, wrapper_type, wrapper_params
+        )
+        if wrapper_type:
+            self.log_info(
+                f"Applied policy wrapper: {wrapper_type} with params {wrapper_params}"
+            )
+
     def _setup_dst_ranks(self, batch_size: int) -> list[tuple[int, int]]:
         """Compute env peer ranks for this rollout worker.
 
@@ -216,15 +377,18 @@ class MultiStepRolloutWorker(Worker):
             else self._eval_sampling_params
         )
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        current_model_type = getattr(self, "_current_model_type", self.cfg.actor.model.model_type)
+
+        if SupportedModel(current_model_type) in [
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.CNN_POLICY,
         ]:
-            kwargs = {"mode": mode}
+            temperature = self._collection_temperature if mode == "eval" else 1.0
+            kwargs = {"mode": mode, "temperature": temperature}
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        if SupportedModel(current_model_type) in [
             SupportedModel.CNN_POLICY,
             SupportedModel.FLOW_POLICY,
             SupportedModel.MLP_POLICY,

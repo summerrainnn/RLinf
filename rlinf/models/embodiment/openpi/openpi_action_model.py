@@ -462,8 +462,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         else:
             # Non-DSRL or eval mode
+            temperature = kwargs.get("temperature", 1.0)
             outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
+                observation, mode=mode, compute_values=compute_values,
+                temperature=temperature,
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -501,6 +503,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        temperature: float = 1.0,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -509,6 +512,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
+            if temperature != 1.0:
+                noise = noise * temperature
         else:
             # DSRL: SAC provides noise, convert dtype to match action_in_proj
             noise = noise.to(self.action_in_proj.weight.dtype)

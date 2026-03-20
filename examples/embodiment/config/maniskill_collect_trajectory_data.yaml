@@ -15,7 +15,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    env,rollout: all
+    env,rollout: 2-7
 
 runner:
   task_type: embodied
@@ -35,94 +35,103 @@ runner:
 
 # Multi-policy trajectory collection settings
 collection:
-  num_tasks: 200
-  base_seed: 42
-  trajectories_per_task: 5
-  num_segments: 2
+  num_tasks: 1
+  base_seed: 420
+  trajectories_per_task: 2500
+  num_segments: 1
   max_steps: 80
-  output_path: "/workspace/RLinf/data/trajectory_data/maniskill_trajectories.json"
+  output_path: "/workspace/RLinf/data/trajectory_data/maniskill_trajectories_openpi.json"
 
+  # NOTE: openvla_oft policy requires a different venv ("openvla-oft").
+  # Use maniskill_collect_trajectory_data_openvla.yaml for that, then merge.
   policies:
-    - name: "sft_base"
-      type: "checkpoint"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      weight: 1.0
-    - name: "rl_ckpt_50"
-      type: "checkpoint"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_50"
-      weight: 1.0
-    - name: "rl_ckpt_100"
-      type: "checkpoint"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_100"
-      weight: 1.0
     - name: "rl_ckpt_150"
       type: "checkpoint"
       model_type: "openpi"
-      model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_150"
+      model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_150_converted"
       weight: 1.0
-    - name: "action_noise_0.05"
-      type: "action_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 0.05
-      weight: 1.0
-    - name: "action_noise_0.15"
-      type: "action_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 0.15
-      weight: 1.0
-    - name: "action_noise_0.30"
-      type: "action_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 0.30
-      weight: 1.0
-    - name: "perception_noise_5"
-      type: "perception_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 5.0
-      weight: 1.0
-    - name: "perception_noise_15"
-      type: "perception_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 15.0
-      weight: 1.0
-    - name: "perception_noise_30"
-      type: "perception_noise"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      noise_std: 30.0
-      weight: 1.0
-    - name: "action_delay_1"
-      type: "action_delay"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      delay_steps: 1
-      weight: 1.0
-    - name: "action_delay_3"
-      type: "action_delay"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      delay_steps: 3
-      weight: 1.0
-    - name: "action_delay_5"
-      type: "action_delay"
-      model_type: "openpi"
-      model_path: "/workspace/RLinf/../RLinf-Pi0-ManiSkill-25Main-SFT"
-      delay_steps: 5
-      weight: 1.0
-    - name: "expert_ppo_openvla"
-      type: "checkpoint"
-      model_type: "openvla_oft"
-      model_path: "/workspace/RLinf/../RLinf-OpenVLAOFT-PPO-ManiSkill3-25ood"
-      weight: 1.0
-      env_name: "openvla"
+      temperature: 1.0
+    
+    # - name: "sft_base"
+    #   type: "checkpoint"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   weight: 1.0
+    # - name: "rl_ckpt_50"
+    #   type: "checkpoint"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_50"
+    #   weight: 1.0
+    # - name: "rl_ckpt_100"
+    #   type: "checkpoint"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_100"
+    #   weight: 1.0
+    # - name: "rl_ckpt_150"
+    #   type: "checkpoint"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/align-VLA/RLinf/logs/20260306-05:07:09-maniskill_ppo_openpi/maniskill_ppo_openpi/checkpoints/global_step_150"
+    #   weight: 1.0
+    # - name: "action_noise_0.05"
+    #   type: "action_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 0.05
+    #   weight: 1.0
+    # - name: "action_noise_0.15"
+    #   type: "action_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 0.15
+    #   weight: 1.0
+    # - name: "action_noise_0.30"
+    #   type: "action_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 0.30
+    #   weight: 1.0
+    # - name: "perception_noise_5"
+    #   type: "perception_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 5.0
+    #   weight: 1.0
+    # - name: "perception_noise_15"
+    #   type: "perception_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 15.0
+    #   weight: 1.0
+    # - name: "perception_noise_30"
+    #   type: "perception_noise"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   noise_std: 30.0
+    #   weight: 1.0
+    # - name: "action_delay_1"
+    #   type: "action_delay"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   delay_steps: 1
+    #   weight: 1.0
+    # - name: "action_delay_3"
+    #   type: "action_delay"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   delay_steps: 3
+    #   weight: 1.0
+    # - name: "action_delay_5"
+    #   type: "action_delay"
+    #   model_type: "openpi"
+    #   model_path: "/workspace/RLinf/RLinf-Pi0-ManiSkill-25Main-SFT"
+    #   delay_steps: 5
+    #   weight: 1.0
+    # - name: "expert_ppo_openvla"
+    #   type: "checkpoint"
+    #   model_type: "openvla_oft"
+    #   model_path: "/workspace/RLinf/RLinf-OpenVLAOFT-PPO-ManiSkill3-25ood"
+    #   weight: 1.0
+    #   env_name: "openvla"
 
 algorithm:
   normalize_advantages: True
@@ -175,7 +184,7 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 64
+    total_num_envs: 60
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 80
@@ -183,7 +192,7 @@ env:
     init_params:
       use_multiple_plates: False
   eval:
-    total_num_envs: 320
+    total_num_envs: 480
     auto_reset: False
     ignore_terminations: True
     max_episode_steps: 80

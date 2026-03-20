@@ -42,11 +42,50 @@ class PreferenceEnvWorker(EnvWorker):
         super().__init__(cfg)
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_maniskill_env(env):
+        """Walk the wrapper chain to find the env with ``total_num_group_envs``.
+
+        The wrapper chain is typically RecordVideo → ManiskillEnv → BaseEnv.
+        We must stop at ManiskillEnv (which owns ``total_num_group_envs``)
+        and NOT unwrap further into BaseEnv.
+        """
+        while env is not None:
+            if hasattr(env, "total_num_group_envs"):
+                return env
+            env = getattr(env, "env", None)
+        return None
+
+    def _seeds_to_reset_options(
+        self, env, seeds: list[int]
+    ) -> tuple[dict | None, int | None]:
+        """Convert task seeds to ``options`` dict for ``env.reset()``.
+
+        Returns:
+            (options_dict, seed_value) – both ``None`` if the env does
+            not support ``total_num_group_envs``.
+        """
+        ms_env = self._find_maniskill_env(env)
+        if ms_env is None:
+            return None, None
+        total = ms_env.total_num_group_envs
+        episode_ids = torch.tensor(
+            [s % total for s in seeds], dtype=torch.long, device=ms_env.device
+        )
+        return {"episode_id": episode_ids}, ms_env.seed
+
+    # ------------------------------------------------------------------
     # Preference collection
     # ------------------------------------------------------------------
 
     def collect_preference_epoch(
-        self, input_channel: Channel, output_channel: Channel
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        env_seeds: list[int] | None = None,
     ) -> dict[str, Any]:
         """Run one eval epoch and return per-environment episode metrics.
 
@@ -74,11 +113,35 @@ class PreferenceEnvWorker(EnvWorker):
         # Track whether success has been recorded for each env to avoid
         # overwriting a True with a later False (transient success states).
         success_recorded = np.zeros(n_envs_total, dtype=bool)
+        # Track the timestep at which each env first succeeds (-1 = never).
+        first_success_steps = np.full(n_envs_total, -1, dtype=np.int32)
 
         env_offset = 0
         for stage_id in range(self.stage_num):
             self.eval_env_list[stage_id].is_start = True
-            extracted_obs, infos = self.eval_env_list[stage_id].reset()
+
+            reset_kwargs: dict = {}
+            if env_seeds is not None:
+                # Each worker handles a slice of the total envs; select our
+                # portion and then the sub-slice for this pipeline stage.
+                n_per_worker = len(env_seeds) // max(self._world_size, 1)
+                worker_seeds = env_seeds[
+                    self._rank * n_per_worker : (self._rank + 1) * n_per_worker
+                ]
+                n_per_stage = len(worker_seeds) // max(self.stage_num, 1)
+                stage_seeds = worker_seeds[
+                    stage_id * n_per_stage : (stage_id + 1) * n_per_stage
+                ]
+                opts, reset_seed = self._seeds_to_reset_options(
+                    self.eval_env_list[stage_id], stage_seeds
+                )
+                if opts is not None:
+                    reset_kwargs["options"] = opts
+                    # Pass seed so ManiSkill re-seeds its RNG, ensuring
+                    # fully deterministic scene configuration.
+                    reset_kwargs["seed"] = reset_seed
+
+            extracted_obs, infos = self.eval_env_list[stage_id].reset(**reset_kwargs)
             env_output = EnvOutput(
                 obs=extracted_obs,
                 final_obs=infos.get("final_observation", None),
@@ -131,11 +194,14 @@ class PreferenceEnvWorker(EnvWorker):
                         if done_flags[local_i] and not success_recorded[global_i]:
                             success_recorded[global_i] = True
                             successes[global_i] = bool(success_tensor[local_i])
+                            if bool(success_tensor[local_i]) and first_success_steps[global_i] < 0:
+                                first_success_steps[global_i] = int(lengths[global_i])
 
                 # Also detect success directly from infos (works even with
                 # ignore_terminations=True, where terminations are suppressed)
                 self._mark_success_from_infos(
-                    infos, success_recorded, successes, env_offset, n_stage_envs
+                    infos, success_recorded, successes, env_offset, n_stage_envs,
+                    first_success_steps, lengths,
                 )
 
                 env_output = EnvOutput(
@@ -165,6 +231,7 @@ class PreferenceEnvWorker(EnvWorker):
             "successes": successes,
             "lengths": lengths,
             "video_paths": video_paths,
+            "first_success_steps": first_success_steps,
         }
 
     # ------------------------------------------------------------------
@@ -178,6 +245,8 @@ class PreferenceEnvWorker(EnvWorker):
         successes: np.ndarray,
         env_offset: int,
         n_stage_envs: int,
+        first_success_steps: np.ndarray | None = None,
+        lengths: np.ndarray | None = None,
     ) -> None:
         """Mark envs as done when success is detected in raw infos.
 
@@ -207,6 +276,12 @@ class PreferenceEnvWorker(EnvWorker):
             if not episode_done[global_i] and bool(success_flags[local_i]):
                 episode_done[global_i] = True
                 successes[global_i] = True
+                if (
+                    first_success_steps is not None
+                    and lengths is not None
+                    and first_success_steps[global_i] < 0
+                ):
+                    first_success_steps[global_i] = int(lengths[global_i])
 
     @staticmethod
     def _extract_success(infos: dict, done_flags: np.ndarray) -> np.ndarray:

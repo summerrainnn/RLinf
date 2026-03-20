@@ -48,9 +48,19 @@ def main():
     parser.add_argument(
         "--bins", type=int, default=20, help="Number of histogram bins"
     )
+    parser.add_argument(
+        "--save-only",
+        action="store_true",
+        help="Save plots as PNG files and exit (no Gradio server)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="quality_distribution.png",
+        help="Output path prefix for saved plots (used with --save-only)",
+    )
     args = parser.parse_args()
 
-    import gradio as gr
     import matplotlib
 
     matplotlib.use("Agg")
@@ -119,6 +129,41 @@ def main():
                 f"{stats['max']:.3f}",
                 f"{success_rate:.1%}",
             ])
+
+    # --- Save-only mode: write PNGs and exit ---
+    if args.save_only:
+        output_base = Path(args.output)
+        output_dir = output_base.parent
+        stem = output_base.stem
+        suffix = output_base.suffix or ".png"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        hist_path = output_dir / f"{stem}_histogram{suffix}"
+        box_path = output_dir / f"{stem}_boxplot{suffix}"
+
+        fig_hist = make_histogram()
+        fig_hist.savefig(str(hist_path), dpi=200, bbox_inches="tight")
+        plt.close(fig_hist)
+        print(f"Saved histogram to {hist_path}")
+
+        fig_box = make_boxplot()
+        fig_box.savefig(str(box_path), dpi=200, bbox_inches="tight")
+        plt.close(fig_box)
+        print(f"Saved box plot to {box_path}")
+
+        # Print stats table
+        print("\nSummary Statistics:")
+        headers = ["Dataset", "Count", "Mean", "Std", "Median", "Min", "Max", "Success Rate"]
+        print(" | ".join(headers))
+        print("-" * 80)
+        for row in table_data:
+            print(" | ".join(str(x) for x in row))
+
+        print("\nDone (save-only mode).")
+        return
+
+    # --- Gradio mode ---
+    import gradio as gr
 
     with gr.Blocks(title="Quality Distribution Viewer") as app:
         gr.Markdown("## Trajectory Quality Distribution")
